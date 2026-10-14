@@ -1,3 +1,102 @@
+2026-10-14 - Version 6.0
+
+This major release adds some new features and fix issues reported by users
+since last release.
+
+  - Restrict use of pg_password_history to pg_read_all_stats and add missing
+    entries in the 5.1.0 to 6.0.0 update SQL file.  Thanks to Georgy Shelkovy
+    for the report.
+
+  - Allow integration of the max_auth_failure feature with pgbouncer.
+    See https://github.com/HexaCluster/credcheck#using-max-auth-failure-with-pgpouncer
+    for explanation. Thanks to sefabalica for the feature request.
+
+  - Fix pgbouncer failure when password_change_first_login is enabled.
+    When a role must change its password first, we only want to allow the
+    password change itself (ALTER ROLE, handled by the caller) plus the handful
+    of harmless session/transaction-control statements that clients and
+    connection poolers unavoidably issue while establishing a session.
+    Thanks to Cihan Baran for the report.
+
+  - Add credcheck.password_valid_min setting to force a short VALID UNTIL
+    window on newly created roles (CREATE ROLE) while keeping the longer
+    credcheck.password_valid_until window when existing roles change their
+    password. Useful to force new users to change their password quickly
+    when the client (DBeaver, pgAdmin, ...) does not support
+    credcheck.password_change_first_login. Thanks to remib-x for the
+    feature request
+
+ -  Replace the dynahash-backed pg_password_history with an integer indexed
+    hash table living entirely in a mmap file.
+    Backward compatibility: v5.x dump file are loaded into memory BEFORE the
+    mapping is initialised, re-inserts the entries into the fresh store and
+    renames the old file to pg_password_history.legacy-migrated so the migration
+    runs once. It runs identically on a standby, so the 5.x -> 6.0 upgrade restart
+    preserves the history on both nodes.
+    
+  - Add an optional last-login history modelled on the Unix last(1)/wtmp.
+    Records user sessions (name, login time, duration, backend pid, source
+    IP and port, and optionally the last SQL query) plus PostgreSQL
+    boot/shutdown/crash markers.
+    New GUCs: credcheck.lastlog, credcheck.lastlog_max,
+    credcheck.lastlog_query_size, credcheck.lastlog_track_query,
+    credcheck.lastlog_flush_interval. New view pg_lastlog over
+    credcheck_lastlog().
+
+  - Change the behavior of the credcheck.no_password_logging to not hide the
+    error statement anymore but instead to replace every PASSWORD '<literal>'
+    clause with dots inplace of the literal.
+    Now when credcheck.no_password_logging is enabled (the default),
+    credcheck masks the value of every PASSWORD '<literal>' clause (and the
+    FDW/user-mapping "password '<literal>'" option) wherever it can reach the
+    log.
+
+  - Add function pg_check_password( IN username name, IN password text ) to
+    check a candidate password (and the associated username) against the
+    credcheck username/password policy without creating or altering a role.
+    Raises the same error as CREATE/ALTER ROLE would when the policy is violated,
+    and returns true when the password is accepted.
+    Note: the password reuse policy is not evaluated here
+
+  - Use palloc for transient strings to fix memory leaks and a heap
+    overflow.
+
+  - Remove test with SHOW password_encryption for PG13 compatibility
+
+  - Change CI workflow to allow local connections on unix socket for test 08
+
+  - Add select test after force change password.
+
+  - Fix privilege escalation via self ALTER ROLE when password_valid_until is
+    set. Restrict the elevation to a pure password change on the caller's own
+    role: the statement is only run with superuser privilege when its sole
+    option is PASSWORD (plus the VALID UNTIL clause credcheck injects
+    itself). Any other role option makes credcheck skip the elevation and
+    let core enforce its normal permission checks, which reject the attempt.
+    Thanks to Alexander Kukushkin for the patch.
+
+  - Replace use of strtok with strtok_r. Thanks to pavagin for the patch.
+    
+  - Depending on the current month, time, and time zone, 60 days in the
+    future is sometimes displayed as "2 mons" or "1 mon 30 days" or possibly
+    something else. Relax to checking between 59 and 61 days ahead.
+    Thanks to Christoph Berg for the patch.    
+
+  - Document that password history is replication-aware on PG 15+.
+    Thanks to Aidar Imamov for the patch.
+
+  - Remove redundant PG_MAJORVERSION variable. Thanks to Aidar Imamov for the patch.
+
+  - Since the introduction of the custom WAL resource manager, every
+    mutation of the password history file is shipped to standbys through
+    normal WAL streaming.  Mention this in the 'Password reuse policy'
+    section so users are aware that the history stays consistent across
+    a primary/replica setup and survives a failover.
+
+  - Fix off-by-one buffer overflow in to_nlower(). Thanks to Aidar Imamov
+    for the patch.
+
+
 2026-06-17 - Version 5.0
 
 This major release adds compatibility with PostgreSQL v19 and makes password
