@@ -11,6 +11,7 @@
 	- [Prohibit password changes](#disallow-password-change)
 	- [Warning before password expire](#warning-before-password-expire)
 	- [Last login information](#last-login-information)
+    - [Using max_auth_failure with PgBouncer](#using-max-auth-failure-with-pgpouncer)
 	- [Examples](#examples)
 	- [Limitations](#limitations)
 	- [Authors](#authors)
@@ -152,6 +153,95 @@ contrib_regression=# select * from pg_lastlog;
 It is also possible to store the last query executed by the user by enabling
 `credcheck.lastlog_track_query`. The query is truncated by default at 1024 bytes
 but this size can be increased using `credcheck.lastlog_query_size`.
+
+### [Using max_auth_failure with PgBouncer](#using-max-auth-failure-with-pgpouncer)
+
+#### Why the counter is bypassed
+
+credcheck counts authentication failures only fires for connections that reach
+PostgreSQL. With `auth_query` (or a userlist), PgBouncer fetches the password
+hash and **verifies the password itself**; a wrong password fails inside
+PgBouncer and no client connection is ever attempted against PostgreSQL. The
+hook never fires, so nothing is counted and no ban is set. This cannot be
+intercepted from inside PostgreSQL — the failure happens in another process.
+
+The patch adds an integration surface so the PgBouncer edge can feed failures
+into credcheck's own ban state (one `credcheck.max_auth_failure` threshold
+governs both direct and pooled connections) and enforce bans through
+`auth_query`.
+
+#### SQL functions
+
+- `credcheck_record_auth_failure(username name) returns int`
+  Report one failure; credcheck applies `credcheck.max_auth_failure` and bans at
+  the threshold. Returns the new count. Superuser-only, REVOKEd from PUBLIC.
+- `credcheck_is_banned(username name) returns bool`
+  True once the role is banned. Read-only; grant to the auth_query role.
+
+Existing `pg_banned_role` (view) and `pg_banned_role_reset(name)` are reused for
+inspection and unban.
+
+##### 1. Enforce bans at the edge (auth_query)
+
+Make the auth_query function refuse a banned role so PgBouncer denies it:
+
+```sql
+-- owned by a role allowed to read pg_authid (SECURITY DEFINER)
+CREATE FUNCTION public.pgbouncer_auth(i_user text)
+RETURNS TABLE(uname text, phash text)
+LANGUAGE sql SECURITY DEFINER AS $$
+  SELECT rolname::text, rolpassword::text
+  FROM pg_authid
+  WHERE rolname = i_user
+    AND rolcanlogin
+    AND NOT credcheck_is_banned(i_user::name)
+$$;
+REVOKE ALL ON FUNCTION public.pgbouncer_auth(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.pgbouncer_auth(text) TO <pgbouncer_auth_user>;
+GRANT EXECUTE ON FUNCTION credcheck_is_banned(name)   TO <pgbouncer_auth_user>;
+```
+
+pgbouncer.ini:
+```
+auth_query = SELECT uname, phash FROM public.pgbouncer_auth($1)
+```
+
+Note: PgBouncer caches auth_query results, so enforcement takes effect on the
+next cache refresh / reconnect, not instantly.
+
+#### 2. Count failures at the edge (fail2ban example)
+
+credcheck cannot see the failures, so they must be reported from where they
+occur. Point fail2ban at the PgBouncer log.
+
+Filter (adjust the regex to your PgBouncer version's log format):
+```
+# /etc/fail2ban/filter.d/pgbouncer-credcheck.conf
+[Definition]
+failregex = login failed: .*"?<F-USER>[^"@ ]+</F-USER>"?@<HOST>
+            password authentication failed for user "?<F-USER>[^"]+</F-USER>"?
+```
+
+Action — report each failure to credcheck (injection-safe via psql `:'u'`):
+```
+# /etc/fail2ban/action.d/credcheck-report.conf
+[Definition]
+actionban = psql "host=PGHOST port=5432 user=f2b_reporter dbname=postgres" \
+              -X -q -v ON_ERROR_STOP=1 \
+              -c "SELECT credcheck_record_auth_failure(:'u')" -v u="<F-USER>"
+actionunban = psql "host=PGHOST port=5432 user=f2b_reporter dbname=postgres" \
+              -X -q -c "SELECT pg_banned_role_reset(:'u')" -v u="<F-USER>"
+```
+
+Grant the reporter role:
+```sql
+GRANT EXECUTE ON FUNCTION credcheck_record_auth_failure(name) TO f2b_reporter; -- superuser-only fn
+```
+(record_auth_failure enforces superuser() internally; run the reporter as a
+superuser, or wrap it in a SECURITY DEFINER function you own and grant that.)
+
+Set fail2ban `maxretry = 1` so every failure is forwarded and credcheck owns the
+threshold via `credcheck.max_auth_failure`.
 
 ### [Examples](#examples)
 

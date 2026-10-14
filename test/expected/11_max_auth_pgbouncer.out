@@ -1,0 +1,107 @@
+LOAD 'credcheck';
+-- Integration points that let a connection pooler (e.g. PgBouncer with
+-- auth_query) feed authentication failures into credcheck's ban state, since
+-- pooler-terminated failures never reach the backend ClientAuthentication hook.
+SET credcheck.max_auth_failure = 3;
+CREATE ROLE ban_test LOGIN PASSWORD 'DummY1passWORD!';
+SELECT pg_banned_role_reset('ban_test');
+ pg_banned_role_reset 
+----------------------
+                    0
+(1 row)
+
+-- Not banned initially.
+SELECT credcheck_is_banned('ban_test');
+ credcheck_is_banned 
+---------------------
+ f
+(1 row)
+
+-- Report failures through the integration point; credcheck applies its own
+-- credcheck.max_auth_failure threshold, exactly as for direct connections.
+SELECT credcheck_record_auth_failure('ban_test');   -- 1
+ credcheck_record_auth_failure 
+-------------------------------
+                             1
+(1 row)
+
+SELECT credcheck_record_auth_failure('ban_test');   -- 2
+ credcheck_record_auth_failure 
+-------------------------------
+                             2
+(1 row)
+
+SELECT credcheck_is_banned('ban_test');             -- still false (2 < 3)
+ credcheck_is_banned 
+---------------------
+ f
+(1 row)
+
+SELECT credcheck_record_auth_failure('ban_test');   -- 3 -> banned
+ credcheck_record_auth_failure 
+-------------------------------
+                             3
+(1 row)
+
+SELECT credcheck_is_banned('ban_test');             -- true
+ credcheck_is_banned 
+---------------------
+ t
+(1 row)
+
+-- Does not keep incrementing once banned.
+SELECT credcheck_record_auth_failure('ban_test');   -- still 3
+ credcheck_record_auth_failure 
+-------------------------------
+                             3
+(1 row)
+
+-- Visible in the same shared ban view used by the in-backend path.
+SELECT failure_count, banned_date IS NOT NULL AS banned
+  FROM pg_banned_role WHERE roleid='ban_test'::regrole;
+ failure_count | banned 
+---------------+--------
+             3 | t
+(1 row)
+
+-- Unknown roles are ignored (mirrors the hook).
+SELECT credcheck_record_auth_failure('does_not_exist');
+ credcheck_record_auth_failure 
+-------------------------------
+                             0
+(1 row)
+
+SELECT credcheck_is_banned('does_not_exist');
+ credcheck_is_banned 
+---------------------
+ f
+(1 row)
+
+-- The existing reset function unbans the role.
+SELECT pg_banned_role_reset('ban_test');
+ pg_banned_role_reset 
+----------------------
+                    1
+(1 row)
+
+SELECT credcheck_is_banned('ban_test');
+ credcheck_is_banned 
+---------------------
+ f
+(1 row)
+
+-- Disabling the feature makes both functions inert.
+SET credcheck.max_auth_failure = 0;
+SELECT credcheck_record_auth_failure('ban_test');
+ credcheck_record_auth_failure 
+-------------------------------
+                             0
+(1 row)
+
+SELECT credcheck_is_banned('ban_test');
+ credcheck_is_banned 
+---------------------
+ f
+(1 row)
+
+DROP ROLE ban_test;
