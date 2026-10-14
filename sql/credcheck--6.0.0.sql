@@ -39,6 +39,9 @@ LANGUAGE C STRICT VOLATILE;
 -- Register a view on the function for ease of use.
 CREATE VIEW pg_password_history AS
   SELECT * FROM pg_password_history();
+REVOKE ALL ON FUNCTION pg_password_history() FROM PUBLIC;
+REVOKE ALL ON pg_password_history FROM PUBLIC;
+GRANT SELECT ON pg_password_history TO pg_read_all_stats;
 
 ----
 -- Change password creation timestamp for all entries of the specified
@@ -49,8 +52,6 @@ CREATE FUNCTION pg_password_history_timestamp( IN username name, IN new_timestam
 RETURNS integer
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT VOLATILE;
-
-GRANT SELECT ON pg_password_history TO PUBLIC;
 
 -- Don't want this to be available to non-superusers.
 REVOKE ALL ON FUNCTION pg_password_history_reset() FROM PUBLIC;
