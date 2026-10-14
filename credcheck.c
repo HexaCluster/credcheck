@@ -538,7 +538,7 @@ static char *to_nlower(const char *str, size_t max) {
   char *lower_str;
   int i = 0;
 
-  lower_str = (char *)calloc(strlen(str) + 1, sizeof(char));
+  lower_str = (char *) palloc(strlen(str) + 1);
 
   for (const char *p = str; *p && i < max; p++) {
     lower_str[i++] = tolower(*p);
@@ -651,10 +651,10 @@ username_check(const char *username, const char *password)
 	else
 	{
 		if (password != NULL && strlen(password) > 0)
-			tmp_pass = strndup(password, INT_MAX);
-		tmp_user = strndup(username, INT_MAX);
-		tmp_contains = strndup(username_contain, INT_MAX);
-		tmp_not_contains = strndup(username_not_contain, INT_MAX);
+			tmp_pass = pstrdup(password);
+		tmp_user = pstrdup(username);
+		tmp_contains = pstrdup(username_contain);
+		tmp_not_contains = pstrdup(username_not_contain);
 	}
 
 	/* Rule 1: username length */
@@ -765,10 +765,12 @@ username_check(const char *username, const char *password)
 	}
 	clean:
 
-	free(tmp_pass);
-	free(tmp_user);
-	free(tmp_contains);
-	free(tmp_not_contains);
+	/* tmp_pass is NULL when no password was given; pfree(NULL) is not allowed */
+	if (tmp_pass != NULL)
+		pfree(tmp_pass);
+	pfree(tmp_user);
+	pfree(tmp_contains);
+	pfree(tmp_not_contains);
 }
 
 /* We just check that the list is valid, no username existing check */
@@ -872,10 +874,10 @@ static void password_check(const char *username, const char *password)
 	}
 	else
 	{
-		tmp_pass = strndup(password, INT_MAX);
-		tmp_user = strndup(username, INT_MAX);
-		tmp_contains = strndup(password_contain, INT_MAX);
-		tmp_not_contains = strndup(password_not_contain, INT_MAX);
+		tmp_pass = pstrdup(password);
+		tmp_user = pstrdup(username);
+		tmp_contains = pstrdup(password_contain);
+		tmp_not_contains = pstrdup(password_not_contain);
 	}
 
 	/* Rule 1: password length */
@@ -985,10 +987,10 @@ static void password_check(const char *username, const char *password)
 
 	clean:
 
-	free(tmp_pass);
-	free(tmp_user);
-	free(tmp_contains);
-	free(tmp_not_contains);
+	pfree(tmp_pass);
+	pfree(tmp_user);
+	pfree(tmp_contains);
+	pfree(tmp_not_contains);
 }
 
 static void
@@ -1495,7 +1497,7 @@ save_password_in_history(const char *username, const char *password)
 		return;
 
 	/* Encrypt the password to the requested format. */
-	encrypted_password = strdup(str_to_sha256(password, username));
+	encrypted_password = str_to_sha256(password, username);
 
 	/* Store the password into share memory and password history file */
 	/* Set up key for hashtable search */
@@ -1531,7 +1533,7 @@ save_password_in_history(const char *username, const char *password)
 
 	LWLockRelease(pgph->lock);
 
-	free(encrypted_password);
+	pfree(encrypted_password);
 }
 
 static void
@@ -1630,7 +1632,7 @@ remove_password_from_history(const char *username, const char *password, int num
                 return;
 
 	/* Encrypt the password to the requested format. */
-	encrypted_password = strdup(str_to_sha256(password, username));
+	encrypted_password = str_to_sha256(password, username);
 
 	elog(DEBUG1, "attempting to remove historized password = '%s' for user = '%s'", encrypted_password, username);
 
@@ -1799,7 +1801,7 @@ check_password_reuse(const char *username, const char *password)
 		return false;
 
 	/* Encrypt the password to the requested format. */
-	encrypted_password = strdup(str_to_sha256(password, username));
+	encrypted_password = str_to_sha256(password, username);
 
 	elog(DEBUG1, "Looking for registered password = '%s' for username = '%s'", encrypted_password, username);
 
@@ -1859,7 +1861,7 @@ check_password_reuse(const char *username, const char *password)
 
 	LWLockRelease(pgph->lock);
 
-	free(encrypted_password);
+	pfree(encrypted_password);
 
 	if (found)
 		ereport(ERROR,
@@ -2916,8 +2918,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 								(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 								 errmsg("timestamp out of range")));
 					j2date(julian, &tm->tm_year, &tm->tm_mon, &tm->tm_mday);
-					validuntil = malloc(sizeof(char)*11);
-					sprintf(validuntil, "%d-%d-%d", tm->tm_year, tm->tm_mon, tm->tm_mday);
+					validuntil = psprintf("%d-%d-%d", tm->tm_year, tm->tm_mon, tm->tm_mday);
 					dvalidUntil = makeDefElem("validUntil", (Node *) makeString(validuntil), -1);
 					((AlterRoleStmt *)parsetree)->options = lappend(((AlterRoleStmt *)parsetree)->options, dvalidUntil);
 					/*
@@ -3052,8 +3053,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 								(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 								 errmsg("timestamp out of range")));
 					j2date(julian, &tm->tm_year, &tm->tm_mon, &tm->tm_mday);
-					validuntil = malloc(sizeof(char)*11);
-					sprintf(validuntil, "%d-%d-%d", tm->tm_year, tm->tm_mon, tm->tm_mday);
+					validuntil = psprintf("%d-%d-%d", tm->tm_year, tm->tm_mon, tm->tm_mday);
 					dvalidUntil = makeDefElem("validUntil", (Node *) makeString(validuntil), 1);
 					((CreateRoleStmt *)parsetree)->options = lappend(((CreateRoleStmt *)parsetree)->options, dvalidUntil);
 				}
