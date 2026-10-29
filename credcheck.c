@@ -83,6 +83,9 @@
 #include "libpq/pqsignal.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/formatting.h"
+#include "catalog/pg_collation.h"
+#include "mb/pg_wchar.h"
 #include "utils/datetime.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -534,16 +537,19 @@ char *str_to_sha256(const char *str, const char *salt);
 bool check_whitelist(char **newval, void **extra, GucSource source);
 bool is_in_whitelist(char *username, char *whitelist);
 
+/*
+ * Lower-case a string following the database collation, as lower() does, so
+ * that multibyte characters are handled as characters (issue #91). Only the
+ * first 'max' characters are kept.
+ */
 static char *to_nlower(const char *str, size_t max) {
   char *lower_str;
-  int i = 0;
 
-  lower_str = (char *) palloc(strlen(str) + 1);
+  lower_str = str_tolower(str, strlen(str), DEFAULT_COLLATION_OID);
 
-  for (const char *p = str; *p && i < max; p++) {
-    lower_str[i++] = tolower(*p);
-  }
-  lower_str[i] = '\0';
+  if (max < INT_MAX && (size_t) pg_mbstrlen(lower_str) > max)
+    lower_str[pg_mbcharcliplen(lower_str, strlen(lower_str), (int) max)] = '\0';
+
   return lower_str;
 }
 
@@ -567,61 +573,73 @@ static bool str_contains(const char *chars, const char *str) {
     return found;
 }
 
+/*
+ * Count the lower case, upper case, digit and other characters of a string in
+ * the database encoding. A multibyte character is counted once (issue #91): it
+ * is a lower or upper case letter when the case mapping of the database
+ * collation changes it, as lower()/upper() do, otherwise a special character.
+ */
 static void check_str_counters(const char *str, int *lower, int *upper,
 				int *digit, int *special) {
-  for (const char *i = str; *i; i++) {
-    if (islower(*i)) {
-      (*lower)++;
-    } else if (isupper(*i)) {
-      (*upper)++;
-    } else if (isdigit(*i)) {
-      (*digit)++;
+  int len;
+
+  for (const char *i = str; *i; i += len) {
+    len = pg_mblen(i);
+
+    if (len == 1) {
+      unsigned char c = (unsigned char) *i;
+
+      if (islower(c)) {
+        (*lower)++;
+      } else if (isupper(c)) {
+        (*upper)++;
+      } else if (isdigit(c)) {
+        (*digit)++;
+      } else {
+        (*special)++;
+      }
     } else {
-      (*special)++;
+      char *lc = str_tolower(i, len, DEFAULT_COLLATION_OID);
+      char *uc = str_toupper(i, len, DEFAULT_COLLATION_OID);
+      bool is_lc = (strlen(lc) == (size_t) len && memcmp(lc, i, len) == 0);
+      bool is_uc = (strlen(uc) == (size_t) len && memcmp(uc, i, len) == 0);
+
+      if (is_lc && !is_uc) {
+        (*lower)++;
+      } else if (is_uc && !is_lc) {
+        (*upper)++;
+      } else {
+        (*special)++;
+      }
+      pfree(lc);
+      pfree(uc);
     }
   }
 }
 
+/*
+ * Return true when a character is repeated consecutively more than max_repeat
+ * times. Characters are compared as a whole, not byte per byte, so that
+ * repeated multibyte characters are detected and a multibyte character made of
+ * identical bytes is not seen as a repetition (issue #91).
+ */
 static bool char_repeat_exceeds(const char *str, int max_repeat) {
-  int occurred = 1;
-  size_t len = strlen(str);
+  const char *prev = NULL;
+  int prevlen = 0;
+  int occurred = 0;
 
-  /*if string has only one character, then no need to proceed further*/
-  if (len==1) {
-	  return false;
-  }
+  for (const char *p = str; *p; p += prevlen) {
+    int len = pg_mblen(p);
 
-  for (size_t i = 0; i < len;) {
-    occurred = 1;
-    /*first character = str[i]
-     second character = str[i+1]
-     search for an adjacent repeated characters
-     for example, in this string "weekend summary"
-     search for the series "ee", "mm"
-     */
-    for (size_t j = (i + 1), k = 1; j < len; j++, k++) {
-      /* character matched*/
-      if (str[i] == str[j]) {
-	/* is the previous, current character positions are adjacent*/
-	if (i + k == j) {
-	  occurred++;
-	  if (occurred > max_repeat) {
-	    return true;
-	  }
-	}
-      }
-
-      /* if we reach an end of the string, no need to process further*/
-      if (j + 1 == len) {
-	return false;
-      }
-
-      /* if the characters are not equal then point "i" to "j"*/
-      if (str[i] != str[j]) {
-	i = j;
-	break;
-      }
+    if (prev != NULL && len == prevlen && memcmp(prev, p, len) == 0) {
+      occurred++;
+      if (occurred > max_repeat)
+        return true;
+    } else {
+      occurred = 1;
     }
+    prev = p;
+    prevlen = len;
   }
   return false;
 }
@@ -657,8 +675,8 @@ username_check(const char *username, const char *password)
 		tmp_not_contains = pstrdup(username_not_contain);
 	}
 
-	/* Rule 1: username length */
-	if (strnlen(tmp_user, INT_MAX) < username_min_length)
+	/* Rule 1: username length, in characters */
+	if (pg_mbstrlen(tmp_user) < username_min_length)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
@@ -880,8 +898,8 @@ static void password_check(const char *username, const char *password)
 		tmp_not_contains = pstrdup(password_not_contain);
 	}
 
-	/* Rule 1: password length */
-	if (strnlen(tmp_pass, INT_MAX) < password_min_length)
+	/* Rule 1: password length, in characters */
+	if (pg_mbstrlen(tmp_pass) < password_min_length)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),

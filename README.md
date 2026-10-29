@@ -103,6 +103,15 @@ Please find the below list of general checks, which we can enforce on credential
 | password_valid_warning | password | throw a warning N days before the password expires | 0 (disabled) |  |  |
 | password_change_first_login | password | force the user to change his password at first login | false (disabled) |  |  |
 
+Lengths and counts are expressed in characters of the database encoding, so
+a multibyte character such as `ф` or `é` in a UTF8 database counts as one
+character for the length and repeat rules. For the character class rules, a
+multibyte letter is an uppercase or lowercase character when the case mapping
+of the database collation changes it (as `upper()` and `lower()` do), and any
+other multibyte character counts as one special character; digits are the
+ASCII digits only. The `*_ignore_case` settings lowercase following the
+database collation too.
+
 There is also the `credcheck.whitelist` GUC that can be used to set a comma separated list of username to exclude from the password policy check. For example:
 ```
 credcheck.whitelist = 'admin,supuser'
