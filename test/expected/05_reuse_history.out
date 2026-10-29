@@ -17,11 +17,11 @@ SET credcheck.password_reuse_history = 2;
 -- When creating user the password must be stored in the history
 CREATE USER credtest WITH PASSWORD 'H8Hdre=S2';
 ALTER USER credtest PASSWORD 'J8YuRe=6O';
-SELECT rolename, password_hash FROM pg_password_history WHERE rolename = 'credtest' ORDER BY password_date;
- rolename |                          password_hash                           
-----------+------------------------------------------------------------------
- credtest | 7488570b80076cf9da26644d5eeb316c4768ff5bee7bf319344e7bb328032098
- credtest | e61e58c22aa6bf31a92b385932f7d0e4dbaba24fa3fdb2982510d6c72a961335
+SELECT rolename, length(password_hash) AS hash_length FROM pg_password_history WHERE rolename = 'credtest' ORDER BY password_date;
+ rolename | hash_length 
+----------+-------------
+ credtest |          64
+ credtest |          64
 (2 rows)
 
 -- fail, the credential is still in the history
@@ -29,11 +29,11 @@ ALTER USER credtest PASSWORD 'J8YuRe=6O';
 ERROR:  Cannot use this credential following the password reuse policy
 -- eject the first credential from the history and add a new one
 ALTER USER credtest PASSWORD 'AJ8YuRe=6O0';
-SELECT rolename, password_hash FROM pg_password_history WHERE rolename = 'credtest' ORDER BY password_date ;
- rolename |                          password_hash                           
-----------+------------------------------------------------------------------
- credtest | e61e58c22aa6bf31a92b385932f7d0e4dbaba24fa3fdb2982510d6c72a961335
- credtest | 79320cea69ba581d5e17255c02ae08060f412f79a7c14d0e24ffca51fc03ec74
+SELECT rolename, length(password_hash) AS hash_length FROM pg_password_history WHERE rolename = 'credtest' ORDER BY password_date ;
+ rolename | hash_length 
+----------+-------------
+ credtest |          64
+ credtest |          64
 (2 rows)
 
 -- fail, the credential is still in the history

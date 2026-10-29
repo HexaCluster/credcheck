@@ -94,5 +94,32 @@ ALTER USER hx_a PASSWORD 'HxPassG_1';                -- G was not saved: ok
 
 DROP USER hx_a;
 SELECT * FROM hx;
+-- the history follows a renamed role: its passwords are salted with the
+-- role OID, which does not change with the name
+CREATE USER hx_r PASSWORD 'HxPassR_1';
+ALTER USER hx_r PASSWORD 'HxPassR_2';
+ALTER USER hx_r RENAME TO hx_r2;
+SELECT * FROM hx;
+ALTER USER hx_r2 PASSWORD 'HxPassR_1';               -- error, in the history
+ALTER USER hx_r2 PASSWORD 'HxPassR_2';               -- error, in the history
+-- the same when the rename is pending in the transaction
+BEGIN;
+ALTER USER hx_r2 RENAME TO hx_r3;
+ALTER USER hx_r3 PASSWORD 'HxPassR_1';               -- error, in the history
+ROLLBACK;
+-- the same password on two roles gives two different hashes (from PG 14,
+-- before the hash is not salted)
+CREATE USER hx_s PASSWORD 'HxPassR_2';
+SELECT count(DISTINCT password_hash) =
+       CASE WHEN current_setting('server_version_num')::int >= 140000
+            THEN 3 ELSE 2 END AS expected_distinct_hashes
+  FROM pg_password_history WHERE rolename IN ('hx_r2', 'hx_s');
+-- a new role with the name of a dropped role starts a new history
+DROP USER hx_r2;
+CREATE USER hx_r2 PASSWORD 'HxPassR_1';
+SELECT * FROM hx;
+DROP USER hx_r2;
+DROP USER hx_s;
+
 DROP VIEW hx;
 SELECT pg_password_history_reset();

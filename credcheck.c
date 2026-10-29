@@ -1985,23 +1985,51 @@ ph_effective_history(const char *username, int *nentries)
 }
 
 /*
+ * Hash of a password stored in the history. The salt is the OID of the role:
+ * unlike its name it does not change when the role is renamed, and it is
+ * preserved by pg_upgrade. Up to credcheck 6.0 the salt was the role name, see
+ * ph_legacy_password_hash(). Before PostgreSQL 14 str_to_sha256() does not use
+ * the salt.
+ */
+static char *
+ph_password_hash(const char *password, Oid roleid)
+{
+	char		salt[32];
+
+	snprintf(salt, sizeof(salt), "oid:%u", roleid);
+	return str_to_sha256(password, salt);
+}
+
+/*
+ * Hash of a password salted with the role name, as stored by credcheck up to
+ * 6.0. Such entries can not be converted without the password: they are still
+ * matched until they leave the history, but no longer after the role has been
+ * renamed.
+ */
+static char *
+ph_legacy_password_hash(const char *password, const char *rolename)
+{
+	return str_to_sha256(password, rolename);
+}
+
+/*
  * Check if the password can be used by the role following the reuse policy,
- * raise an error if it can not. Return true when the password must be saved
- * into the history, *password_hash then receives its hash.
+ * raise an error if it can not. 'roleid' is the OID of the role, InvalidOid
+ * when it does not exist yet (CREATE ROLE). Return true when the password
+ * must be saved into the history once the statement has succeeded, its hash
+ * is then computed with ph_password_hash().
  */
 static bool
-check_password_reuse(const char *username, const char *password,
-					 char **password_hash)
+check_password_reuse(const char *username, Oid roleid, const char *password)
 {
 	PhLocalEntry *local;
 	char	   *encrypted_password;
+	char	   *legacy_password;
 	bool		found = false;
 	int			n;
 	int			i;
 
 	Assert(username != NULL);
-
-	*password_hash = NULL;
 
 	if (password == NULL)
 		return false;
@@ -2013,17 +2041,26 @@ check_password_reuse(const char *username, const char *password,
 	if (!pgph || !pgph_hash)
 		return false;
 
-	/* Encrypt the password to the requested format. */
-	encrypted_password = str_to_sha256(password, username);
+	/*
+	 * Hash the password with the role OID, and with the role name to match
+	 * the entries stored by previous versions. A role that does not exist yet
+	 * can only have entries left by a previous role of the same name.
+	 */
+	encrypted_password = OidIsValid(roleid) ?
+		ph_password_hash(password, roleid) : NULL;
+	legacy_password = ph_legacy_password_hash(password, username);
 
-	elog(DEBUG1, "Looking for registered password = '%s' for username = '%s'",
-		 encrypted_password, username);
+	elog(DEBUG1, "Looking for registered password = '%s' or '%s' for username = '%s'",
+		 encrypted_password ? encrypted_password : "", legacy_password, username);
 
 	local = ph_effective_history(username, &n);
 	for (i = 0; i < n && !found; i++)
 	{
-		if (!local[i].used || strcmp(local[i].rolename, username) != 0
-			|| strcmp(local[i].password_hash, encrypted_password) != 0)
+		if (!local[i].used || strcmp(local[i].rolename, username) != 0)
+			continue;
+		if (strcmp(local[i].password_hash, legacy_password) != 0
+			&& (encrypted_password == NULL
+				|| strcmp(local[i].password_hash, encrypted_password) != 0))
 			continue;
 
 		found = true;
@@ -2049,7 +2086,10 @@ check_password_reuse(const char *username, const char *password,
 			(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 				errmsg(gettext_noop("Cannot use this credential following the password reuse policy"))));
 
-	*password_hash = encrypted_password;
+	if (encrypted_password)
+		pfree(encrypted_password);
+	pfree(legacy_password);
+
 	return true;
 }
 
@@ -3089,7 +3129,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 	 * They are applied when the transaction commits.
 	 */
 	char	   *hist_save_user = NULL;
-	char	   *hist_save_hash = NULL;
+	char	   *hist_save_password = NULL;
 	char	   *hist_rename_old = NULL;
 	char	   *hist_rename_new = NULL;
 	List	   *hist_drop_users = NIL;
@@ -3198,7 +3238,6 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				AlterRoleStmt *stmt = (AlterRoleStmt *)parsetree;
 				ListCell      *option;
 				char	  *password;
-				char	  *password_hash = NULL;
 				bool	   save_password = false;
 				bool	   has_other_option = false;
 				DefElem    *dvalidUntil = NULL;
@@ -3267,7 +3306,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 
 					password = strVal(dpassword->arg);
 					save_password = check_password_reuse(stmt->role->rolename,
-														 password, &password_hash);
+														 target, password);
 				}
 #endif
 				/*
@@ -3344,7 +3383,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				if (save_password)
 				{
 					hist_save_user = pstrdup(stmt->role->rolename);
-					hist_save_hash = password_hash;
+					hist_save_password = pstrdup(password);
 				}
 #endif
 				/* Own password changed: lift the restriction on success */
@@ -3373,7 +3412,6 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 										password_valid_min : password_valid_until;
 				bool	    save_password = false;
 				char	   *password;
-				char	   *password_hash = NULL;
 				DefElem    *dpassword = NULL;
 				DefElem    *dvalidUntil = NULL;
 
@@ -3401,8 +3439,8 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				if (dpassword && dpassword->arg)
 				{
 					password = strVal(dpassword->arg);
-					save_password = check_password_reuse(stmt->role, password,
-														 &password_hash);
+					save_password = check_password_reuse(stmt->role, InvalidOid,
+														 password);
 				}
 #endif
 				/*
@@ -3474,7 +3512,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				if (save_password)
 				{
 					hist_save_user = pstrdup(stmt->role);
-					hist_save_hash = password_hash;
+					hist_save_password = pstrdup(password);
 				}
 #endif
 				strcpy(load_roleid, stmt->role);
@@ -3528,7 +3566,23 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 	 */
 #if PG_VERSION_NUM >= 120000
 	if (hist_save_user != NULL)
-		ph_queue(PH_OP_SAVE, hist_save_user, NULL, hist_save_hash);
+	{
+		/*
+		 * Hash the password with the OID of the role, which exists now even
+		 * for CREATE ROLE, and only keep the hash.
+		 */
+		Oid			saved_roleid = get_role_oid(hist_save_user, true);
+
+		if (OidIsValid(saved_roleid))
+		{
+			char	   *hash = ph_password_hash(hist_save_password, saved_roleid);
+
+			ph_queue(PH_OP_SAVE, hist_save_user, NULL, hash);
+			pfree(hash);
+		}
+		memset(hist_save_password, 0, strlen(hist_save_password));
+		pfree(hist_save_password);
+	}
 	if (hist_rename_old != NULL)
 		ph_queue(PH_OP_RENAME, hist_rename_old, hist_rename_new, NULL);
 	if (hist_drop_users != NIL)

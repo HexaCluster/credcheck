@@ -149,6 +149,51 @@ SELECT * FROM hx;
 ----------+---------
 (0 rows)
 
+-- the history follows a renamed role: its passwords are salted with the
+-- role OID, which does not change with the name
+CREATE USER hx_r PASSWORD 'HxPassR_1';
+ALTER USER hx_r PASSWORD 'HxPassR_2';
+ALTER USER hx_r RENAME TO hx_r2;
+SELECT * FROM hx;
+ rolename | entries 
+----------+---------
+ hx_r2    |       2
+(1 row)
+
+ALTER USER hx_r2 PASSWORD 'HxPassR_1';               -- error, in the history
+ERROR:  Cannot use this credential following the password reuse policy
+ALTER USER hx_r2 PASSWORD 'HxPassR_2';               -- error, in the history
+ERROR:  Cannot use this credential following the password reuse policy
+-- the same when the rename is pending in the transaction
+BEGIN;
+ALTER USER hx_r2 RENAME TO hx_r3;
+ALTER USER hx_r3 PASSWORD 'HxPassR_1';               -- error, in the history
+ERROR:  Cannot use this credential following the password reuse policy
+ROLLBACK;
+-- the same password on two roles gives two different hashes (from PG 14,
+-- before the hash is not salted)
+CREATE USER hx_s PASSWORD 'HxPassR_2';
+SELECT count(DISTINCT password_hash) =
+       CASE WHEN current_setting('server_version_num')::int >= 140000
+            THEN 3 ELSE 2 END AS expected_distinct_hashes
+  FROM pg_password_history WHERE rolename IN ('hx_r2', 'hx_s');
+ expected_distinct_hashes 
+--------------------------
+ t
+(1 row)
+
+-- a new role with the name of a dropped role starts a new history
+DROP USER hx_r2;
+CREATE USER hx_r2 PASSWORD 'HxPassR_1';
+SELECT * FROM hx;
+ rolename | entries 
+----------+---------
+ hx_r2    |       1
+ hx_s     |       1
+(2 rows)
+
+DROP USER hx_r2;
+DROP USER hx_s;
 DROP VIEW hx;
 SELECT pg_password_history_reset();
  pg_password_history_reset 
