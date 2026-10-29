@@ -467,7 +467,10 @@ static void lastlog_init_header(void);
 static void lastlog_append_marker(LastlogType type);
 static void lastlog_record_login(Port *port);
 static void lastlog_finalize_session(int code, Datum arg);
-static void lastlog_track_last_query(const char *query_string);
+static void lastlog_track_last_query(const char *query_string, int location, int len);
+static void mask_passwords(char *s);
+/* nesting level of utility statements being executed (lastlog tracking) */
+static int ll_utility_depth = 0;
 static void lastlog_msync(int flags);
 PGDLLEXPORT void lastlog_bgworker_main(Datum main_arg);
 static void lastlog_bgworker_shutdown(int code, Datum arg);
@@ -2212,24 +2215,59 @@ lastlog_finalize_session(int code, Datum arg)
 	ll_my_slot = -1;
 }
 
-/* Copy the current query text into this backend's live slot (ExecutorStart). */
+/*
+ * Copy the statement being executed into this backend's live slot. Called for
+ * the statements sent by the client only, from ExecutorStart for planned
+ * statements and from ProcessUtility for utility statements (issue #87).
+ * 'location' and 'len' delimit the statement in a query string holding several
+ * of them (-1 / 0 when unknown, as in PlannedStmt). The stored copy is cut at
+ * a character boundary and its passwords are masked, as in the server log.
+ */
 static void
-lastlog_track_last_query(const char *query_string)
+lastlog_track_last_query(const char *query_string, int location, int len)
 {
 	LastlogActive  *a;
+	const char *start;
+	char	   *copy;
+	int			cliplen;
 
 	if (!lastlog_enabled || !lastlog_track_query || lastlog == NULL
-		|| ll_my_slot < 0 || query_string == NULL)
+		|| ll_my_slot < 0 || query_string == NULL || lastlog_query_size <= 1)
 		return;
 
 	a = &lastlog->active[ll_my_slot];
 	if (a->last_query == NULL)
 		return;
 
+	/* Extract the current statement of a multi-statement string. */
+	start = query_string;
+	if (location > 0 && location <= (int) strlen(query_string))
+		start = query_string + location;
+	else
+		location = 0;
+	if (len <= 0 || len > (int) strlen(start))
+		len = (int) strlen(start);
+
+	/* skip leading white space, as for the logged statement */
+	while (len > 0 && isspace((unsigned char) *start))
+	{
+		start++;
+		len--;
+	}
+
+	/* keep what fits in the slot without splitting a multibyte character */
+	cliplen = pg_mbcliplen(start, len, lastlog_query_size - 1);
+	copy = pnstrdup(start, cliplen);
+
+	/* Never keep a password in clear text in pg_lastlog. */
+	mask_passwords(copy);
+
 	LWLockAcquire(lastlog->lock, LW_EXCLUSIVE);
 	if (a->in_use)
-		strlcpy(a->last_query, query_string, lastlog_query_size);
+		strlcpy(a->last_query, copy, lastlog_query_size);
 	LWLockRelease(lastlog->lock);
+
+	pfree(copy);
 }
 
 /* Flush the mmap region to disk. */
@@ -2769,6 +2807,31 @@ is_force_change_allowed_stmt(Node *parsetree)
 	}
 }
 
+/*
+ * Execute the utility statement. ll_utility_depth tells cc_ExecutorStart()
+ * that a plan comes from a utility statement (EXPLAIN ANALYZE, CREATE TABLE
+ * AS, ...) already recorded in lastlog, so that it does not overwrite it.
+ */
+static void
+cc_run_utility(PEL_PROCESSUTILITY_PROTO)
+{
+	ll_utility_depth++;
+	PG_TRY();
+	{
+		if (prev_ProcessUtility)
+			prev_ProcessUtility(PEL_PROCESSUTILITY_ARGS);
+		else
+			standard_ProcessUtility(PEL_PROCESSUTILITY_ARGS);
+	}
+	PG_CATCH();
+	{
+		ll_utility_depth--;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	ll_utility_depth--;
+}
+
 /* Return true if the ALTER ROLE statement sets or removes the password. */
 static bool
 alter_role_has_password(AlterRoleStmt *stmt)
@@ -2809,6 +2872,14 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 
 	elog(DEBUG1, "Start cc_ProcessUtility()");
 
+	/*
+	 * Remember the last executed statement for the lastlog view: utility
+	 * statements do not go through ExecutorStart (issue #87).
+	 */
+	if (context == PROCESS_UTILITY_TOPLEVEL)
+		lastlog_track_last_query(queryString, pstmt->stmt_location,
+								 pstmt->stmt_len);
+
 	/* If real user connection and top level (not SPI re-enter, etc) */
 	if (MyProcPort != NULL && NOT_IN_PARALLEL_WORKER &&
 			(context == PROCESS_UTILITY_TOPLEVEL || context == PROCESS_UTILITY_QUERY)
@@ -2823,10 +2894,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 		 */
 		if (superuser() && superuser_nocheck)
 		{
-			if (prev_ProcessUtility)
-				prev_ProcessUtility(PEL_PROCESSUTILITY_ARGS);
-			else
-				standard_ProcessUtility(PEL_PROCESSUTILITY_ARGS);
+			cc_run_utility(PEL_PROCESSUTILITY_ARGS);
 			return;
 		}
 
@@ -3205,10 +3273,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 							| SECURITY_RESTRICTED_OPERATION);
 	}
 
-	if (prev_ProcessUtility)
-		prev_ProcessUtility(PEL_PROCESSUTILITY_ARGS);
-	else
-		standard_ProcessUtility(PEL_PROCESSUTILITY_ARGS);
+	cc_run_utility(PEL_PROCESSUTILITY_ARGS);
 
 	/* Restore user's privileges */
 	if (use_superuser_priv)
@@ -5008,9 +5073,19 @@ cc_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		}
 	}
 
-	/* Remember the last executed query for the lastlog view. */
-	if (queryDesc->sourceText != NULL)
-		lastlog_track_last_query(queryDesc->sourceText);
+	/*
+	 * Remember the last executed query for the lastlog view: only a statement
+	 * sent by the client, not those executed by a function through SPI. With
+	 * the extended protocol debug_query_string is a copy of the source text,
+	 * hence the string comparison.
+	 */
+	if (ll_utility_depth == 0
+		&& queryDesc->sourceText != NULL && debug_query_string != NULL
+		&& (queryDesc->sourceText == debug_query_string
+			|| strcmp(queryDesc->sourceText, debug_query_string) == 0))
+		lastlog_track_last_query(queryDesc->sourceText,
+								 queryDesc->plannedstmt->stmt_location,
+								 queryDesc->plannedstmt->stmt_len);
 
 	/* Continue the normal behavior */
 	if (prev_ExecutorStart)

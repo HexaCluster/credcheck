@@ -131,6 +131,82 @@ $node->poll_query_until('postgres',
 pass('a closed session flips to disconnected');
 
 # ---------------------------------------------------------------------------
+# 5b. The query column holds the last statement sent by the client, utility
+#     statements included, without its terminating semicolon, and never a
+#     password in clear text (issue #87).
+# ---------------------------------------------------------------------------
+
+# Run a script as lluser in its own session and return the query recorded
+# for that session once it is finalized. With $use_c the script is sent as a
+# single query string (psql -c), otherwise psql splits it into statements.
+sub ll_last_query
+{
+	my ($sql, $use_c) = @_;
+	my @extra = $use_c ? ('-c', $sql) : ();
+	my $marker = $node->safe_psql('postgres',
+		"SELECT coalesce(max(logout_time), '-infinity') FROM pg_lastlog");
+	$node->psql('postgres', $use_c ? '' : $sql,
+		extra_params => [ '--username', 'lluser', @extra ]);
+	$node->poll_query_until('postgres',
+		"SELECT count(*) > 0 FROM pg_lastlog WHERE username = 'lluser' "
+	  . "AND state = 'disconnected' AND logout_time > '$marker'",
+		't')
+	  or die "timed out waiting for the lluser session to be finalized";
+	return $node->safe_psql('postgres',
+		"SELECT query FROM pg_lastlog WHERE username = 'lluser' "
+	  . "AND state = 'disconnected' ORDER BY logout_time DESC LIMIT 1");
+}
+
+$node->safe_psql('postgres', 'ALTER ROLE lluser CREATEROLE');
+$node->safe_psql('postgres', q{
+CREATE FUNCTION ll_spi() RETURNS int LANGUAGE plpgsql AS
+$$ BEGIN PERFORM 'll_inner_marker'; RETURN 1; END $$;
+});
+
+is(ll_last_query("SELECT 42;\nCREATE TEMP TABLE ll_t (i int);"),
+	'CREATE TEMP TABLE ll_t (i int)',
+	'a utility statement is recorded as the last query');
+
+is( ll_last_query(
+		q{SELECT 1; CREATE ROLE ll_pw1 PASSWORD $$S3cretDollar$$}, 1),
+	'CREATE ROLE ll_pw1 PASSWORD $$............$$',
+	'only the current statement of a multi-statement string is kept, password masked');
+
+is(ll_last_query("CREATE ROLE ll_pw2 PASSWORD 'S3cretQuote';"),
+	"CREATE ROLE ll_pw2 PASSWORD '...........'",
+	'a password is masked in the recorded query');
+
+is(ll_last_query('SELECT 1; EXPLAIN ANALYZE SELECT 2', 1),
+	'EXPLAIN ANALYZE SELECT 2',
+	'the plan of a utility statement does not replace the statement');
+
+is(ll_last_query('SELECT ll_spi();'), 'SELECT ll_spi()',
+	'statements executed by a function do not replace the client statement');
+
+is(ll_last_query("SELECT \$1::text AS v \\bind ll_ext_marker \\g"),
+	'SELECT $1::text AS v ',
+	'a statement sent with the extended protocol is recorded');
+
+# a long multibyte query is cut at a character boundary (lastlog_query_size
+# is 1024 bytes by default): the stored text is valid and fits the slot
+my $long = "SELECT '" . ("\x{0444}" x 2000) . "';";
+my $stored = ll_last_query($long);
+ok(length($stored) > 0 && length($stored) <= 1023,
+	'a long query is truncated to lastlog_query_size');
+is( $node->safe_psql('postgres',
+		"SELECT octet_length(query) <= 1023 AND query LIKE 'SELECT ''%' "
+	  # every character after the 8-byte prefix is 2 bytes: an odd count
+	  # means a character was cut in the middle
+	  . "AND (octet_length(query) - 8) % 2 = 0 "
+	  . "FROM pg_lastlog WHERE username = 'lluser' AND state = 'disconnected' "
+	  . "ORDER BY logout_time DESC LIMIT 1"),
+	't',
+	'a truncated multibyte query is valid and fits the slot');
+
+$node->safe_psql('postgres', 'DROP ROLE ll_pw1');
+$node->safe_psql('postgres', 'DROP ROLE ll_pw2');
+
+# ---------------------------------------------------------------------------
 # 6. A clean restart preserves the history (mmap reload), writes a shutdown
 #    marker, and does NOT create a false crash marker.
 # ---------------------------------------------------------------------------

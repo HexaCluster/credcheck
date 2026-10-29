@@ -161,8 +161,13 @@ contrib_regression=# select * from pg_lastlog;
 ```
 
 It is also possible to store the last query executed by the user by enabling
-`credcheck.lastlog_track_query`. The query is truncated by default at 1024 bytes
-but this size can be increased using `credcheck.lastlog_query_size`.
+`credcheck.lastlog_track_query`. This is the last statement sent by the client,
+utility statements included: when a query string holds several statements
+only the one being executed is kept, and statements executed by a function
+are not recorded. Passwords are masked as in the server log (see
+[Password masking in logs](#password-masking-in-logs)). The query is truncated
+by default at 1024 bytes but this size can be increased using
+`credcheck.lastlog_query_size`.
 
 ### [Using max_auth_failure with PgBouncer](#using-max-auth-failure-with-pgbouncer)
 
@@ -716,7 +721,9 @@ This DDL is also provided in the separated file `event_trigger.sql`.
 When `credcheck.no_password_logging` is enabled (the default), credcheck masks
 passwords in the messages sent to the server log (statements logged by
 `log_statement` or `log_min_duration_statement`, the `STATEMENT:` line of an
-error, error details and context). Each character of the secret is replaced by a dot, for example:
+error, error details and context) and in the `query` column of `pg_lastlog`
+(the latter always, whatever the value of `credcheck.no_password_logging`).
+Each character of the secret is replaced by a dot, for example:
 
 ```
 LOG:  statement: CREATE ROLE alice LOGIN PASSWORD '............';
