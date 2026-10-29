@@ -91,13 +91,13 @@ LANGUAGE C STRICT VOLATILE;
 CREATE VIEW pg_banned_role AS
   SELECT roleid::regrole, failure_count, banned_date FROM pg_banned_role();
 
-GRANT SELECT ON pg_banned_role TO PUBLIC;
-
 -- Don't want this to be available to non-superusers.
 REVOKE ALL ON FUNCTION pg_banned_role_reset() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_banned_role_reset(name) FROM PUBLIC;
 
-
+REVOKE ALL ON FUNCTION pg_banned_role() FROM PUBLIC;
+REVOKE ALL ON pg_banned_role FROM PUBLIC;
+GRANT SELECT ON pg_banned_role TO pg_read_all_stats;
 
 ----
 -- Check a candidate password (and the associated username) against the
