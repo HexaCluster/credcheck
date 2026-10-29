@@ -2786,6 +2786,8 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 	char	   *hist_rename_old = NULL;
 	char	   *hist_rename_new = NULL;
 	List	   *hist_drop_users = NIL;
+	/* Same for lifting a forced password change (issue #90). */
+	Oid			force_reset_roleid = InvalidOid;
 
 	elog(DEBUG1, "Start cc_ProcessUtility()");
 
@@ -2836,6 +2838,22 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 							errmsg(gettext_noop("you must change your password first."))));
+
+			/*
+			 * The only ALTER ROLE allowed while a password change is forced
+			 * is a password change of the session's own role: changing the
+			 * password of another role must not lift the restriction.
+			 */
+			if (nodeTag(parsetree) == T_AlterRoleStmt && force_change_password)
+			{
+				AlterRoleStmt *astmt = (AlterRoleStmt *) parsetree;
+
+				if (!alter_role_has_password(astmt)
+					|| get_rolespec_oid(astmt->role, true) != GetUserId())
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+								errmsg(gettext_noop("you must change your password first."))));
+			}
 		}
 
 		switch (nodeTag(parsetree))
@@ -3002,12 +3020,9 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 					hist_save_password = pstrdup(password);
 				}
 #endif
-				if (force_change_password)
-				{
-					/* RESET variable, valuestr = NULL*/
-					set_force_change_password(InvalidOid, get_role_oid(stmt->role->rolename, true), NULL);
-					force_change_password = false;
-				}
+				/* Own password changed: lift the restriction on success */
+				if (force_change_password && dpassword != NULL)
+					force_reset_roleid = get_role_oid(stmt->role->rolename, true);
 
 				break;
 			}
@@ -3195,6 +3210,19 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 			remove_user_from_history((char *) lfirst(item));
 	}
 #endif
+	if (force_reset_roleid != InvalidOid)
+	{
+		/* RESET the role setting, valuestr = NULL */
+		set_force_change_password(InvalidOid, force_reset_roleid, NULL);
+
+		/*
+		 * Clear the flag for this session through the GUC machinery so that
+		 * it is restored if the transaction that changed the password aborts.
+		 */
+		(void) set_config_option("credcheck_internal.force_change_password",
+								 "off", PGC_SUSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, 0, false);
+	}
 
 	if (MyProcPort != NULL && context == PROCESS_UTILITY_TOPLEVEL && NOT_IN_PARALLEL_WORKER)
 	{

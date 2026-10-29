@@ -17,6 +17,32 @@ RESET credcheck.disallow_change_password;
 DROP USER issue89;
 
 --
+-- Issue #90: a forced password change must not be lifted by an ALTER ROLE on
+-- another role, nor by a password change that is rolled back.
+--
+SET credcheck.password_change_first_login = true;
+CREATE USER issue90 PASSWORD 'Iss90PassWORD!';
+RESET credcheck.password_change_first_login;
+CREATE USER issue90_other PASSWORD 'Iss90OtherWORD!';
+\c - issue90
+SELECT 1;                                             -- error, must change first
+ALTER USER issue90_other PASSWORD 'Iss90Bypass1!';    -- error, not its own role
+SELECT 1;                                             -- error, still forced
+ALTER USER issue90 CONNECTION LIMIT 3;                -- error, not a password change
+BEGIN;
+ALTER USER issue90 PASSWORD 'Iss90Rolled1!';
+ROLLBACK;
+SELECT 1;                                             -- error, change rolled back
+ALTER USER issue90 PASSWORD 'Iss90Changed1!';         -- the real change
+SELECT 1 AS after_password_change;
+\c - postgres
+SELECT count(*) FROM pg_catalog.pg_db_role_setting
+  WHERE setrole = 'issue90'::regrole
+    AND 'credcheck_internal.force_change_password=true' = ANY(setconfig);
+DROP USER issue90;
+DROP USER issue90_other;
+
+--
 -- Issue #93: the password history must not be dropped by a DROP ROLE that
 -- fails, and must not be written by a CREATE/ALTER ROLE that fails.
 --
