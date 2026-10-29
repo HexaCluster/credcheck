@@ -3316,7 +3316,12 @@ pgph_tab_init(void)
 static inline uint32
 pgph_bucket_of(pgphHashKey *key)
 {
-	uint32	h = hash_bytes((const unsigned char *) key, sizeof(pgphHashKey));
+	uint32	h;
+#if PG_VERSION_NUM >= 130000
+	h = hash_bytes((const unsigned char *) key, sizeof(pgphHashKey));
+#else
+	h = DatumGetUInt32(hash_any((const unsigned char *) key, sizeof(pgphHashKey)));
+#endif
 
 	return h % pgph_hdr->nbuckets;
 }
