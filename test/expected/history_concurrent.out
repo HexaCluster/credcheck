@@ -1,0 +1,56 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1b s1a s2a s1c s2n
+step s1b: BEGIN;
+step s1a: ALTER ROLE iso_r PASSWORD 'IsoPassB_1';
+step s2a: ALTER ROLE iso_r PASSWORD 'IsoPassB_1'; <waiting ...>
+step s1c: COMMIT;
+step s2a: <... completed>
+ERROR:  Cannot use this credential following the password reuse policy
+step s2n: SELECT count(*) AS entries FROM pg_password_history WHERE rolename = 'iso_r';
+entries
+-------
+      2
+(1 row)
+
+reset
+-----
+t    
+(1 row)
+
+
+starting permutation: s1b s1a s2a s1r s2n
+step s1b: BEGIN;
+step s1a: ALTER ROLE iso_r PASSWORD 'IsoPassB_1';
+step s2a: ALTER ROLE iso_r PASSWORD 'IsoPassB_1'; <waiting ...>
+step s1r: ROLLBACK;
+step s2a: <... completed>
+step s2n: SELECT count(*) AS entries FROM pg_password_history WHERE rolename = 'iso_r';
+entries
+-------
+      2
+(1 row)
+
+reset
+-----
+t    
+(1 row)
+
+
+starting permutation: s1b s1a s2c s1c s2n
+step s1b: BEGIN;
+step s1a: ALTER ROLE iso_r PASSWORD 'IsoPassB_1';
+step s2c: ALTER ROLE iso_r PASSWORD 'IsoPassC_1'; <waiting ...>
+step s1c: COMMIT;
+step s2c: <... completed>
+step s2n: SELECT count(*) AS entries FROM pg_password_history WHERE rolename = 'iso_r';
+entries
+-------
+      3
+(1 row)
+
+reset
+-----
+t    
+(1 row)
+
