@@ -2745,6 +2745,22 @@ is_force_change_allowed_stmt(Node *parsetree)
 	}
 }
 
+/* Return true if the ALTER ROLE statement sets or removes the password. */
+static bool
+alter_role_has_password(AlterRoleStmt *stmt)
+{
+	ListCell   *option;
+
+	foreach(option, stmt->options)
+	{
+		DefElem    *defel = (DefElem *) lfirst(option);
+
+		if (strcmp(defel->defname, "password") == 0)
+			return true;
+	}
+	return false;
+}
+
 static void
 cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 {
@@ -2783,7 +2799,8 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 			 * When disallow_change_password is enable we return
 			 * an error to any usertrying to change his password.
 			 */
-			if (nodeTag(parsetree) == T_AlterRoleStmt && disallow_change_password)
+			if (nodeTag(parsetree) == T_AlterRoleStmt && disallow_change_password
+				&& alter_role_has_password((AlterRoleStmt *) parsetree))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 							errmsg(gettext_noop("you are not allowed to change password."))));
