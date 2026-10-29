@@ -48,3 +48,16 @@ LANGUAGE C STRICT VOLATILE;
 REVOKE ALL ON FUNCTION pg_banned_role() FROM PUBLIC;
 REVOKE ALL ON pg_banned_role FROM PUBLIC;
 GRANT SELECT ON pg_banned_role TO pg_read_all_stats;
+
+CREATE FUNCTION credcheck_record_auth_failure( IN username name )
+RETURNS integer
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION credcheck_is_banned( IN username name )
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT STABLE;
+
+REVOKE ALL ON FUNCTION credcheck_record_auth_failure(name) FROM PUBLIC;
+REVOKE ALL ON FUNCTION credcheck_is_banned(name) FROM PUBLIC;
