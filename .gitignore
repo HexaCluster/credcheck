@@ -7,3 +7,5 @@
 *.bc
 results/*
 regression.*
+output_iso/
+tmp_check/

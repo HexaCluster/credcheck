@@ -19,9 +19,12 @@ REGRESS_OPTS  = --inputdir=test --load-extension=credcheck
 TESTS = 01_username 02_password 03_rename 04_alter_pwd \
 	05_reuse_history 06_reuse_interval 07_valid_until \
 	08_first_login 09_plpgsql 10_no_password_logging \
-	11_max_auth_pgbouncer 12_role_changes 13_multibyte
+	11_max_auth_pgbouncer 12_role_changes 13_multibyte 14_history_xact
 
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
+
+ISOLATION = history_concurrent
+ISOLATION_OPTS = --inputdir=test --load-extension=credcheck
 
 PG_CONFIG = pg_config
 

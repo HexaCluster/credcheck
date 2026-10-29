@@ -109,6 +109,34 @@ is( $standby->safe_psql('postgres',
 	'0',
 	'DROP ROLE removes user history on the standby');
 
+# The history is transactional: nothing is written, and so nothing is
+# replicated, for a transaction that is rolled back.
+$primary->safe_psql('postgres', q{
+BEGIN;
+CREATE ROLE dave LOGIN PASSWORD 'pwd_dave_1';
+ALTER ROLE alice PASSWORD 'pwd_alice_4';
+DROP ROLE dave;
+ALTER ROLE alice RENAME TO alice_tmp;
+ROLLBACK;
+});
+is($primary->safe_psql('postgres', $sql_count), "alice|3",
+	'a rolled back transaction leaves the primary history unchanged');
+
+# A committed transaction is replicated with all its changes. Its commit
+# also flushes the WAL written before it, so the standby check below would
+# see the changes of the rolled back transaction if they had been logged.
+$primary->safe_psql('postgres', q{
+BEGIN;
+CREATE ROLE dave LOGIN PASSWORD 'pwd_dave_1';
+ALTER ROLE dave PASSWORD 'pwd_dave_2';
+COMMIT;
+});
+$primary->wait_for_catchup($standby);
+
+is($standby->safe_psql('postgres', $sql_count), "alice|3\ndave|2",
+	'only the committed transaction is replicated to the standby');
+$primary->safe_psql('postgres', q{DROP ROLE dave});
+
 # Explicit reset
 $primary->safe_psql('postgres',
 	q{SELECT pg_password_history_reset('alice')});

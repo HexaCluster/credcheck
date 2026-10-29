@@ -469,6 +469,27 @@ The credcheck extension adds the "Password Reuse Policy" in release 1.0. To used
 
 All users passwords are historicized in shared memory together with the timestamps of when these passwords were set. The passwords history is saved into a file named `$PGDATA/pg_password_history` to be reloaded in shared memory at startup. This file must be part of your backups if you don't want to loose the password history, hopefully pg_basebackup will take care of it. Starting from PostgreSQL 15, the password history is also replication-aware: a custom WAL resource manager ships every mutation (add, remove, rename, reset, timestamp update) to standbys through the usual WAL streaming, so the history stays consistent across a primary/replica setup and survives a failover. Passwords are stored and compared as sha256 hashes, never in plain text.
 
+The password history follows the transactions. The changes made by `CREATE ROLE`,
+`ALTER ROLE ... PASSWORD`, `ALTER ROLE ... RENAME` and `DROP ROLE` are only
+applied to the history, and written to the WAL, when the transaction commits:
+
+* a rolled back transaction, a `ROLLBACK TO SAVEPOINT` or a PL/pgSQL exception
+  block leaves no trace in the history, old entries are not removed either;
+* until the commit, the changes are only visible to the transaction that made
+  them: its own password checks take them into account (setting the same new
+  password twice is rejected, `DROP ROLE` then `CREATE ROLE` of the same name
+  starts a new history) but the `pg_password_history` view shows the committed
+  history only;
+* a transaction that changed the history can not be prepared with
+  `PREPARE TRANSACTION`;
+* a password change waits for the end of a transaction that has already
+  changed the password of the same role, instead of failing with a
+  "tuple concurrently updated" error, so that it is checked against the
+  committed history.
+
+The functions `pg_password_history_reset()` and `pg_password_history_timestamp()`
+are not transactional, they change the history immediately.
+
 The password history size is set to 65535 records by default and can be adjusted using the `credcheck.history_max_size` configuration directive. Change of this GUC require a PostgreSQL restart. One record in the history takes 144 bytes, so the default is to allocate around 10 MB of additional shared memory for the password history.
 
 Two settings allow to control the behavior of this feature:

@@ -74,6 +74,8 @@
 #endif
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/lmgr.h"
+#include "access/xact.h"
 #include "storage/shmem.h"
 #if PG_VERSION_NUM >= 140000
 #include "utils/wait_event.h"
@@ -1499,63 +1501,6 @@ credcheck_rmgr_identify(uint8 info)
 #endif		/* PG_VERSION_NUM >= 150000 */
 
 #if PG_VERSION_NUM >= 120000
-static void
-save_password_in_history(const char *username, const char *password)
-{
-	char	*encrypted_password;
-	pgphHashKey key;
-	pgphEntry  *entry;
-	TimestampTz dt_now = GetCurrentTimestamp();
-
-	Assert(username != NULL);
-	Assert(password != NULL);
-
-	if (password_reuse_history == 0 && password_reuse_interval == 0)
-		return;
-
-	/* Safety check... */
-	if (!pgph || !pgph_hash)
-		return;
-
-	/* Encrypt the password to the requested format. */
-	encrypted_password = str_to_sha256(password, username);
-
-	/* Store the password into share memory and password history file */
-	/* Set up key for hashtable search */
-	strcpy(key.rolename, username) ;
-	strcpy(key.password_hash, encrypted_password);
-
-	/* Lookup the hash table entry with exclusive lock. */
-	LWLockAcquire(pgph->lock, LW_EXCLUSIVE);
-
-	/* Create new entry, if not present */
-	entry = pgph_tab_find(&key);
-	if (!entry)
-	{
-		dt_now = GetCurrentTimestamp();
-
-		elog(DEBUG1, "Add new entry in history hash table: (%s, '%s', '%s')",
-							username, encrypted_password,
-							timestamptz_to_str(dt_now));
-
-		/* OK to create a new hashtable entry */
-		entry = pgph_entry_alloc(&key, dt_now);
-
-		/* Flush the new entry to disk */
-		if (entry)
-		{
-#if PG_VERSION_NUM >= 150000
-			credcheck_xlog_pwd_add(username, encrypted_password, dt_now);
-#endif
-			elog(DEBUG1, "entry added, flush change to disk");
-			flush_password_history();
-		}
-	}
-
-	LWLockRelease(pgph->lock);
-
-	pfree(encrypted_password);
-}
 
 static void
 rename_user_in_history(const char *username, const char *newname)
@@ -1633,128 +1578,6 @@ entry_cmp(const void *lhs, const void *rhs)
 }
 #endif
 
-static void
-remove_password_from_history(const char *username, const char *password, int numentries)
-{
-	char	 *encrypted_password;
-	int32	 num_entries;
-	int32	 num_user_entries = 0;
-	int32	 num_removed = 0;
-	pgphEntry    *entry;
-	pgphEntry   **entries;
-	int	   i = 0;
-
-
-	if (password_reuse_history == 0 && password_reuse_interval == 0)
-		return;
-
-	Assert(username != NULL);
-	Assert(password != NULL);
-
-	/* Safety check ... shouldn't get here unless shmem is set up. */
-	if (!pgph || !pgph_hash)
-		return;
-
-	/* Encrypt the password to the requested format. */
-	encrypted_password = str_to_sha256(password, username);
-
-	elog(DEBUG1, "attempting to remove historized password = '%s' for user = '%s'", encrypted_password, username);
-
-	LWLockAcquire(pgph->lock, LW_EXCLUSIVE);
-
-	num_entries = pgph_tab_count();
-
-	entries = palloc((num_entries > 0 ? num_entries : 1) * sizeof(pgphEntry *));
-
-	/* stores entries related to the username to be sorted by date */
-	{
-		int32   _i;
-
-		for (_i = 0; _i < (int32) pgph_hdr->capacity; _i++)
-		{
-			if (!pgph_slots[_i].used)
-				continue;
-			entry = &pgph_slots[_i].entry;
-			if (strcmp(entry->key.rolename, username) == 0)
-				entries[i++] = entry;
-		}
-	}
-
-	if (i == 0)
-	{
-		elog(DEBUG1, "no entry in the history for user: %s", username);
-
-		LWLockRelease(pgph->lock);
-
-		pfree(entries);
-
-		return;
-	}
-
-	num_user_entries = i;
-
-	/* Sort into increasing order by date */
-	qsort(entries, i, sizeof(pgphEntry *), entry_cmp);
-
-	/*
-	 * Remove the oldest tuples when password_reuse_history is reached
-	 * until password_reuse_history size is respected for this user,
-	 * except if password_reuse_interval is enabled and not reached.
-	 *
-	 * A ascending index must exits on the date column of the table,
-	 * we use this index to treat the oldest entries first in the scan.
-	 */
-	for (i = 0; i < num_user_entries; i++)
-	{
-		bool keep = false;
-
-		/* if we have a retention delay remove entries that has expired */
-		if (password_reuse_interval > 0)
-		{
-			TimestampTz     dt_now = GetCurrentTimestamp();
-			float8	  result;
-
-			result = ((float8) (dt_now - entries[i]->password_date)) / 1000000.0; /* in seconds */
-			result /= 86400; /* in days */
-
-			elog(DEBUG1, "password_reuse_interval: %d, entry age: %d",
-										password_reuse_interval,
-										(int) result);
-			/*
-			 * When the delay have not expired, keep the entry if the
-			 * number of entry exceed password_reuse_history
-			 */
-			if (password_reuse_interval >= (int) result)
-				keep = true;
-			else
-				elog(DEBUG1, "remove_password_from_history(): this history entry has expired");
-		}
-
-		if (!keep)
-		{
-			/* we need to remove the entries that exceed history size */
-			if ((num_user_entries - i) >= password_reuse_history)
-			{
-#if PG_VERSION_NUM >= 150000
-				credcheck_xlog_pwd_remove(entries[i]->key.rolename,
-										  entries[i]->key.password_hash);
-#endif
-				elog(DEBUG1, "removing entry %d from the history (%s, %s)", i,
-											entries[i]->key.rolename,
-											entries[i]->key.password_hash);
-				pgph_tab_remove(&entries[i]->key);
-				num_removed++;
-			}
-		}
-	}
-	pfree(entries);
-
-	/* Flush the new entry to disk */
-	if (num_removed > 0)
-		flush_password_history();
-
-	LWLockRelease(pgph->lock);
-}
 
 static void
 remove_user_from_history(const char *username)
@@ -1805,17 +1628,380 @@ remove_user_from_history(const char *username)
 	LWLockRelease(pgph->lock);
 }
 
-/* Check if the password can be reused */
-static bool
-check_password_reuse(const char *username, const char *password)
+/*
+ * Transactional password history.
+ *
+ * CREATE/ALTER/RENAME/DROP ROLE do not change the shared password history
+ * directly: they queue operations in a backend-local list that is applied, in
+ * order, when the transaction commits (XACT_EVENT_PRE_COMMIT) and discarded
+ * when it aborts. Each operation records the nesting level of the
+ * (sub)transaction that queued it, so that ROLLBACK TO SAVEPOINT and PL/pgSQL
+ * exception blocks discard their own operations only.
+ *
+ * The reuse check of a password reads the committed history with the pending
+ * operations of the current transaction replayed over it, so that a
+ * transaction sees its own changes (for example DROP ROLE x then CREATE ROLE x
+ * in the same transaction).
+ */
+typedef enum PhOpKind
 {
-	int	   count_in_history = 0;
-	pgphEntry    *entry;
-	bool	  found = false;
-	char	 *encrypted_password;
-	int32	 _i;
+	PH_OP_SAVE,					/* trim the role's history then add a password */
+	PH_OP_RENAME,				/* move the history of a role to a new name */
+	PH_OP_DROP					/* remove the history of a role */
+} PhOpKind;
+
+typedef struct PhPendingOp
+{
+	PhOpKind	kind;
+	int			nestlevel;		/* (sub)transaction that queued the operation */
+	char		rolename[NAMEDATALEN];
+	char		newname[NAMEDATALEN];	/* PH_OP_RENAME */
+	char		password_hash[PG_SHA256_DIGEST_STRING_LENGTH];	/* PH_OP_SAVE */
+	TimestampTz date;			/* PH_OP_SAVE: date of the password change */
+	int			reuse_history;	/* PH_OP_SAVE: policy when it was queued */
+	int			reuse_interval;
+} PhPendingOp;
+
+/* Pending operations of the current transaction, in TopTransactionContext */
+static List *ph_pending = NIL;
+
+/* Copy of a history entry, used to replay the pending operations locally */
+typedef struct PhLocalEntry
+{
+	char		rolename[NAMEDATALEN];
+	char		password_hash[PG_SHA256_DIGEST_STRING_LENGTH];
+	TimestampTz date;
+	bool		used;
+} PhLocalEntry;
+
+/*
+ * Decide which entries of a role must be removed before a new password is
+ * added: the oldest entries beyond credcheck.password_reuse_history, except
+ * those still within credcheck.password_reuse_interval days. 'dates' is sorted
+ * into increasing order. This is the rule credcheck has always applied.
+ */
+static void
+ph_trim_select(const TimestampTz *dates, int n, int reuse_history,
+			   int reuse_interval, TimestampTz now, bool *remove)
+{
+	int			i;
+
+	for (i = 0; i < n; i++)
+	{
+		bool		keep = false;
+
+		remove[i] = false;
+
+		/* if we have a retention delay keep the entries that have not expired */
+		if (reuse_interval > 0)
+		{
+			float8		age;
+
+			age = ((float8) (now - dates[i])) / 1000000.0;	/* in seconds */
+			age /= 86400;	/* in days */
+			if (reuse_interval >= (int) age)
+				keep = true;
+		}
+
+		/* remove the entries that exceed the history size */
+		if (!keep && (n - i) >= reuse_history)
+			remove[i] = true;
+	}
+}
+
+/*
+ * Apply a PH_OP_SAVE operation to the shared history: trim the history of the
+ * role then add the new password.
+ */
+static void
+ph_shared_save(const PhPendingOp *op)
+{
+	pgphEntry **entries;
+	TimestampTz *dates;
+	bool	   *remove;
+	pgphHashKey key;
+	int			n = 0;
+	int			nchanged = 0;
+	int32		_i;
+
+	if (!pgph || !pgph_hash)
+		return;
+
+	LWLockAcquire(pgph->lock, LW_EXCLUSIVE);
+
+	entries = palloc(Max(pgph_tab_count(), 1) * sizeof(pgphEntry *));
+	for (_i = 0; _i < (int32) pgph_hdr->capacity; _i++)
+	{
+		if (pgph_slots[_i].used &&
+			strcmp(pgph_slots[_i].entry.key.rolename, op->rolename) == 0)
+			entries[n++] = &pgph_slots[_i].entry;
+	}
+
+	if (n > 0)
+	{
+		qsort(entries, n, sizeof(pgphEntry *), entry_cmp);
+		dates = palloc(n * sizeof(TimestampTz));
+		remove = palloc(n * sizeof(bool));
+		for (_i = 0; _i < n; _i++)
+			dates[_i] = entries[_i]->password_date;
+		ph_trim_select(dates, n, op->reuse_history, op->reuse_interval,
+					   GetCurrentTimestamp(), remove);
+
+		for (_i = 0; _i < n; _i++)
+		{
+			if (!remove[_i])
+				continue;
+			elog(DEBUG1, "removing entry from the history (%s, %s)",
+				 entries[_i]->key.rolename, entries[_i]->key.password_hash);
+#if PG_VERSION_NUM >= 150000
+			credcheck_xlog_pwd_remove(entries[_i]->key.rolename,
+									  entries[_i]->key.password_hash);
+#endif
+			pgph_tab_remove(&entries[_i]->key);
+			nchanged++;
+		}
+		pfree(dates);
+		pfree(remove);
+	}
+	pfree(entries);
+
+	/* add the new password, unless it is already there */
+	memset(&key, 0, sizeof(key));
+	strlcpy(key.rolename, op->rolename, NAMEDATALEN);
+	strlcpy(key.password_hash, op->password_hash, PG_SHA256_DIGEST_STRING_LENGTH);
+	if (pgph_tab_find(&key) == NULL && pgph_entry_alloc(&key, op->date) != NULL)
+	{
+		elog(DEBUG1, "Add new entry in history hash table: (%s, '%s', '%s')",
+			 op->rolename, op->password_hash, timestamptz_to_str(op->date));
+#if PG_VERSION_NUM >= 150000
+		credcheck_xlog_pwd_add(op->rolename, op->password_hash, op->date);
+#endif
+		nchanged++;
+	}
+
+	if (nchanged > 0)
+		flush_password_history();
+
+	LWLockRelease(pgph->lock);
+}
+
+/* Apply the pending operations to the shared history, in order. */
+static void
+ph_apply_pending(void)
+{
+	List	   *ops = ph_pending;
+	ListCell   *lc;
+
+	ph_pending = NIL;
+
+	foreach(lc, ops)
+	{
+		PhPendingOp *op = (PhPendingOp *) lfirst(lc);
+
+		switch (op->kind)
+		{
+			case PH_OP_SAVE:
+				ph_shared_save(op);
+				break;
+			case PH_OP_RENAME:
+				rename_user_in_history(op->rolename, op->newname);
+				break;
+			case PH_OP_DROP:
+				remove_user_from_history(op->rolename);
+				break;
+		}
+	}
+}
+
+/* Queue an operation for the current (sub)transaction. */
+static void
+ph_queue(PhOpKind kind, const char *rolename, const char *newname,
+		 const char *password_hash)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+	PhPendingOp *op = (PhPendingOp *) palloc0(sizeof(PhPendingOp));
+
+	op->kind = kind;
+	op->nestlevel = GetCurrentTransactionNestLevel();
+	strlcpy(op->rolename, rolename, NAMEDATALEN);
+	if (newname)
+		strlcpy(op->newname, newname, NAMEDATALEN);
+	if (password_hash)
+		strlcpy(op->password_hash, password_hash, PG_SHA256_DIGEST_STRING_LENGTH);
+	op->date = GetCurrentTimestamp();
+	op->reuse_history = password_reuse_history;
+	op->reuse_interval = password_reuse_interval;
+
+	ph_pending = lappend(ph_pending, op);
+
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/* Does the list of names contain this one? */
+static bool
+ph_name_in_list(List *names, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, names)
+	{
+		if (strcmp((char *) lfirst(lc), name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Return a local copy of the history of the roles involved in the pending
+ * operations of the transaction and of 'username', with the pending
+ * operations replayed over it. *nentries receives the array size; entries
+ * with used == false have been removed.
+ */
+static PhLocalEntry *
+ph_effective_history(const char *username, int *nentries)
+{
+	List	   *names = list_make1(pstrdup(username));
+	PhLocalEntry *local;
+	int			n = 0;
+	int			size;
+	ListCell   *lc;
+	int32		_i;
+
+	foreach(lc, ph_pending)
+	{
+		PhPendingOp *op = (PhPendingOp *) lfirst(lc);
+
+		if (!ph_name_in_list(names, op->rolename))
+			names = lappend(names, pstrdup(op->rolename));
+		if (op->kind == PH_OP_RENAME && !ph_name_in_list(names, op->newname))
+			names = lappend(names, pstrdup(op->newname));
+	}
+
+	/* committed entries of these roles, room for the pending saves */
+	size = list_length(ph_pending) + 1;
+	LWLockAcquire(pgph->lock, LW_SHARED);
+	for (_i = 0; _i < (int32) pgph_hdr->capacity; _i++)
+	{
+		if (pgph_slots[_i].used &&
+			ph_name_in_list(names, pgph_slots[_i].entry.key.rolename))
+			size++;
+	}
+	local = (PhLocalEntry *) palloc0(size * sizeof(PhLocalEntry));
+	for (_i = 0; _i < (int32) pgph_hdr->capacity && n < size; _i++)
+	{
+		pgphEntry  *entry = &pgph_slots[_i].entry;
+
+		if (!pgph_slots[_i].used || !ph_name_in_list(names, entry->key.rolename))
+			continue;
+		strlcpy(local[n].rolename, entry->key.rolename, NAMEDATALEN);
+		strlcpy(local[n].password_hash, entry->key.password_hash,
+				PG_SHA256_DIGEST_STRING_LENGTH);
+		local[n].date = entry->password_date;
+		local[n].used = true;
+		n++;
+	}
+	LWLockRelease(pgph->lock);
+
+	/* replay the pending operations */
+	foreach(lc, ph_pending)
+	{
+		PhPendingOp *op = (PhPendingOp *) lfirst(lc);
+
+		switch (op->kind)
+		{
+			case PH_OP_SAVE:
+			{
+				int		   *idx = palloc(Max(n, 1) * sizeof(int));
+				TimestampTz *dates = palloc(Max(n, 1) * sizeof(TimestampTz));
+				bool	   *remove = palloc(Max(n, 1) * sizeof(bool));
+				bool		found = false;
+				int			m = 0;
+				int			i,
+							j;
+
+				for (i = 0; i < n; i++)
+				{
+					if (local[i].used && strcmp(local[i].rolename, op->rolename) == 0)
+						idx[m++] = i;
+				}
+				/* sort the role's entries into increasing date order */
+				for (i = 1; i < m; i++)
+				{
+					int			k = idx[i];
+
+					for (j = i - 1; j >= 0 && local[idx[j]].date > local[k].date; j--)
+						idx[j + 1] = idx[j];
+					idx[j + 1] = k;
+				}
+				for (i = 0; i < m; i++)
+					dates[i] = local[idx[i]].date;
+				ph_trim_select(dates, m, op->reuse_history, op->reuse_interval,
+							   GetCurrentTimestamp(), remove);
+				for (i = 0; i < m; i++)
+				{
+					if (remove[i])
+						local[idx[i]].used = false;
+				}
+				for (i = 0; i < n; i++)
+				{
+					if (local[i].used && strcmp(local[i].rolename, op->rolename) == 0
+						&& strcmp(local[i].password_hash, op->password_hash) == 0)
+						found = true;
+				}
+				if (!found && n < size)
+				{
+					strlcpy(local[n].rolename, op->rolename, NAMEDATALEN);
+					strlcpy(local[n].password_hash, op->password_hash,
+							PG_SHA256_DIGEST_STRING_LENGTH);
+					local[n].date = op->date;
+					local[n].used = true;
+					n++;
+				}
+				pfree(idx);
+				pfree(dates);
+				pfree(remove);
+				break;
+			}
+			case PH_OP_RENAME:
+				for (_i = 0; _i < n; _i++)
+				{
+					if (local[_i].used && strcmp(local[_i].rolename, op->rolename) == 0)
+						strlcpy(local[_i].rolename, op->newname, NAMEDATALEN);
+				}
+				break;
+			case PH_OP_DROP:
+				for (_i = 0; _i < n; _i++)
+				{
+					if (local[_i].used && strcmp(local[_i].rolename, op->rolename) == 0)
+						local[_i].used = false;
+				}
+				break;
+		}
+	}
+
+	list_free_deep(names);
+	*nentries = n;
+	return local;
+}
+
+/*
+ * Check if the password can be used by the role following the reuse policy,
+ * raise an error if it can not. Return true when the password must be saved
+ * into the history, *password_hash then receives its hash.
+ */
+static bool
+check_password_reuse(const char *username, const char *password,
+					 char **password_hash)
+{
+	PhLocalEntry *local;
+	char	   *encrypted_password;
+	bool		found = false;
+	int			n;
+	int			i;
 
 	Assert(username != NULL);
+
+	*password_hash = NULL;
 
 	if (password == NULL)
 		return false;
@@ -1830,76 +2016,105 @@ check_password_reuse(const char *username, const char *password)
 	/* Encrypt the password to the requested format. */
 	encrypted_password = str_to_sha256(password, username);
 
-	elog(DEBUG1, "Looking for registered password = '%s' for username = '%s'", encrypted_password, username);
+	elog(DEBUG1, "Looking for registered password = '%s' for username = '%s'",
+		 encrypted_password, username);
 
-	/* Lookup the hash table entry with shared lock. */
-	LWLockAcquire(pgph->lock, LW_SHARED);
-
-	for (_i = 0; _i < (int32) pgph_hdr->capacity; _i++)
+	local = ph_effective_history(username, &n);
+	for (i = 0; i < n && !found; i++)
 	{
-		if (!pgph_slots[_i].used)
+		if (!local[i].used || strcmp(local[i].rolename, username) != 0
+			|| strcmp(local[i].password_hash, encrypted_password) != 0)
 			continue;
-		entry = &pgph_slots[_i].entry;
-		if (strcmp(entry->key.rolename, username) == 0)
+
+		found = true;
+
+		/* an entry older than the reuse interval does not count */
+		if (password_reuse_interval > 0)
 		{
-			/* if the password is found in the history remove it if the interval is passed */
-			if (strcmp(encrypted_password, entry->key.password_hash) == 0)
+			float8		age;
+
+			age = ((float8) (GetCurrentTimestamp() - local[i].date)) / 1000000.0;
+			age /= 86400;
+			if (password_reuse_interval < (int) age)
 			{
-				elog(DEBUG1, "password found in history, username = '%s',"
-					     " password: '%s', saved at date: '%s'", username, 
-									     entry->key.password_hash,
-									     timestamptz_to_str(entry->password_date));
-
-				/* mark that the password hash was found in the history */
-				found = true;
-
-				/* Check the password age against the reuse interval */
-				if (password_reuse_interval > 0)
-				{
-					TimestampTz	dt_now = GetCurrentTimestamp();
-					float8	  result;
-					result = ((float8) (dt_now - entry->password_date)) / 1000000.0; /* in seconds */
-					result /= 86400; /* in days */
-					elog(DEBUG1, "password_reuse_interval: %d, entry age: %d",
-												password_reuse_interval,
-												(int) result);
-
-					/*
-					 * if the delay have expired skip the entry, it will be
-					 * removed later in remove_password_from_history()
-					 */
-					if (password_reuse_interval < (int) result)
-					{
-						elog(DEBUG1, "this history entry has expired");
-						found = false;
-						count_in_history--;
-					}
-				}
+				elog(DEBUG1, "this history entry has expired");
+				found = false;
 			}
-
-			/*
-			 * Even if the password was found we continue to count the number of
-			 * password stored in the history for this user. This count is used
-			 * to remove the oldest password that exceed the password_reuse_history
-			 */
-			count_in_history++;
 		}
 	}
-
-	LWLockRelease(pgph->lock);
-
-	pfree(encrypted_password);
+	pfree(local);
 
 	if (found)
 		ereport(ERROR,
 			(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 				errmsg(gettext_noop("Cannot use this credential following the password reuse policy"))));
 
-	/* Password not found, remove passwords exceeding the history size */
-	remove_password_from_history(username, password, count_in_history);
-
-	/* The password was not found, add the password to the history */
+	*password_hash = encrypted_password;
 	return true;
+}
+
+/* Apply or discard the pending history operations at transaction end. */
+static void
+ph_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+			ph_apply_pending();
+			break;
+		case XACT_EVENT_PRE_PREPARE:
+			if (ph_pending != NIL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot PREPARE a transaction that has changed the credcheck password history")));
+			break;
+		default:
+			/* commit, abort or prepare done: the list memory is gone */
+			ph_pending = NIL;
+			break;
+	}
+}
+
+/* Discard or hand over the operations of a subtransaction at its end. */
+static void
+ph_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					SubTransactionId parentSubid, void *arg)
+{
+	int			level = GetCurrentTransactionNestLevel();
+	List	   *kept = NIL;
+	ListCell   *lc;
+	MemoryContext oldcxt;
+
+	if (ph_pending == NIL)
+		return;
+
+	if (event == SUBXACT_EVENT_COMMIT_SUB)
+	{
+		foreach(lc, ph_pending)
+		{
+			PhPendingOp *op = (PhPendingOp *) lfirst(lc);
+
+			if (op->nestlevel >= level)
+				op->nestlevel = level - 1;
+		}
+	}
+	else if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+		foreach(lc, ph_pending)
+		{
+			PhPendingOp *op = (PhPendingOp *) lfirst(lc);
+
+			if (op->nestlevel < level)
+				kept = lappend(kept, op);
+			else
+				pfree(op);
+		}
+		list_free(ph_pending);
+		ph_pending = kept;
+		MemoryContextSwitchTo(oldcxt);
+	}
 }
 #endif
 
@@ -2717,6 +2932,12 @@ _PG_init(void)
 	/* Install hooks */
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = cc_ProcessUtility;
+
+#if PG_VERSION_NUM >= 120000
+	/* apply or discard the password history changes at transaction end */
+	RegisterXactCallback(ph_xact_callback, NULL);
+	RegisterSubXactCallback(ph_subxact_callback, NULL);
+#endif
 	prev_check_password_hook = check_password_hook;
 	check_password_hook = check_password;
 #if PG_VERSION_NUM >= 150000
@@ -2743,6 +2964,10 @@ _PG_fini(void)
 	check_password_hook = prev_check_password_hook;
 	ProcessUtility_hook = prev_ProcessUtility;
 	emit_log_hook = prev_log_hook;
+#if PG_VERSION_NUM >= 120000
+	UnregisterXactCallback(ph_xact_callback, NULL);
+	UnregisterSubXactCallback(ph_subxact_callback, NULL);
+#endif
 #if PG_VERSION_NUM >= 150000
 	shmem_request_hook = prev_shmem_request_hook;
 #endif
@@ -2858,12 +3083,13 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 	int     save_sec_context;
 
 	/*
-	 * Changes to the password history are only applied once the statement
-	 * has succeeded, otherwise a statement rejected by PostgreSQL (permission
+	 * Changes to the password history are only queued once the statement has
+	 * succeeded, otherwise a statement rejected by PostgreSQL (permission
 	 * denied, role already exists, ...) could still alter them (issue #93).
+	 * They are applied when the transaction commits.
 	 */
 	char	   *hist_save_user = NULL;
-	char	   *hist_save_password = NULL;
+	char	   *hist_save_hash = NULL;
 	char	   *hist_rename_old = NULL;
 	char	   *hist_rename_new = NULL;
 	List	   *hist_drop_users = NIL;
@@ -2972,6 +3198,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				AlterRoleStmt *stmt = (AlterRoleStmt *)parsetree;
 				ListCell      *option;
 				char	  *password;
+				char	  *password_hash = NULL;
 				bool	   save_password = false;
 				bool	   has_other_option = false;
 				DefElem    *dvalidUntil = NULL;
@@ -3025,8 +3252,22 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				/* check the password set */
 				if (dpassword && dpassword->arg)
 				{
+					Oid		target = get_role_oid(stmt->role->rolename, true);
+
+					/*
+					 * Serialize the password changes of a role until the end
+					 * of the transaction, so that the reuse check of a
+					 * concurrent change sees this one once it is committed.
+					 * This does not conflict with the AccessShareLock taken
+					 * when a dependency on the role is recorded.
+					 */
+					if (OidIsValid(target))
+						LockSharedObject(AuthIdRelationId, target, 0,
+										 ShareUpdateExclusiveLock);
+
 					password = strVal(dpassword->arg);
-					save_password = check_password_reuse(stmt->role->rolename, password);
+					save_password = check_password_reuse(stmt->role->rolename,
+														 password, &password_hash);
 				}
 #endif
 				/*
@@ -3103,7 +3344,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				if (save_password)
 				{
 					hist_save_user = pstrdup(stmt->role->rolename);
-					hist_save_password = pstrdup(password);
+					hist_save_hash = password_hash;
 				}
 #endif
 				/* Own password changed: lift the restriction on success */
@@ -3132,6 +3373,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 										password_valid_min : password_valid_until;
 				bool	    save_password = false;
 				char	   *password;
+				char	   *password_hash = NULL;
 				DefElem    *dpassword = NULL;
 				DefElem    *dvalidUntil = NULL;
 
@@ -3159,7 +3401,8 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				if (dpassword && dpassword->arg)
 				{
 					password = strVal(dpassword->arg);
-					save_password = check_password_reuse(stmt->role, password);
+					save_password = check_password_reuse(stmt->role, password,
+														 &password_hash);
 				}
 #endif
 				/*
@@ -3231,7 +3474,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				if (save_password)
 				{
 					hist_save_user = pstrdup(stmt->role);
-					hist_save_password = pstrdup(password);
+					hist_save_hash = password_hash;
 				}
 #endif
 				strcpy(load_roleid, stmt->role);
@@ -3279,18 +3522,21 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 	if (use_superuser_priv)
 		SetUserIdAndSecContext(save_userid, save_sec_context);
 
-	/* The statement succeeded, apply the deferred history changes. */
+	/*
+	 * The statement succeeded, queue the history changes: they are applied
+	 * when the transaction commits.
+	 */
 #if PG_VERSION_NUM >= 120000
 	if (hist_save_user != NULL)
-		save_password_in_history(hist_save_user, hist_save_password);
+		ph_queue(PH_OP_SAVE, hist_save_user, NULL, hist_save_hash);
 	if (hist_rename_old != NULL)
-		rename_user_in_history(hist_rename_old, hist_rename_new);
+		ph_queue(PH_OP_RENAME, hist_rename_old, hist_rename_new, NULL);
 	if (hist_drop_users != NIL)
 	{
 		ListCell   *item;
 
 		foreach(item, hist_drop_users)
-			remove_user_from_history((char *) lfirst(item));
+			ph_queue(PH_OP_DROP, (char *) lfirst(item), NULL, NULL);
 	}
 #endif
 	if (force_reset_roleid != InvalidOid)
