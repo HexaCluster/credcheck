@@ -3689,12 +3689,12 @@ pgaf_entry_alloc(pgafHashKey *key, float failure_count)
 	pgafEntry  *entry;
 	bool	found;
 
-	if (hash_get_num_entries(pgaf_hash) >= pgph_max)
+	if (hash_get_num_entries(pgaf_hash) >= pgaf_max)
 	{
 		ereport(LOG,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("can not allocate enough memory for new entry in auth failure cache."),
-				 errhint("You shoul increase credcheck.history_max_size.")));
+				 errhint("You should increase credcheck.auth_failure_cache_size.")));
 		return NULL;
 	}
 
@@ -4557,6 +4557,13 @@ credcheck_record_auth_failure(PG_FUNCTION_ARGS)
 	entry = pgaf_entry_alloc(&key, fail_cnt);
 
 	LWLockRelease(pgaf->lock);
+
+	/*
+	 * The cache is full (credcheck.auth_failure_cache_size): the failure was
+	 * not recorded, so do not report a count the ban logic will never see.
+	 */
+	if (entry == NULL)
+		PG_RETURN_INT32(0);
 
 	PG_RETURN_INT32((int) fail_cnt);
 }
