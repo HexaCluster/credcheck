@@ -4592,8 +4592,24 @@ credcheck_is_banned(PG_FUNCTION_ARGS)
 	if (fail_max == 0 || !pgaf || !pgaf_hash)
 		PG_RETURN_BOOL(false);
 
+	/*
+	 * Mirror credcheck_max_auth_failure(): a whitelisted role is never
+	 * rejected by the hook, even if it still has a failure entry recorded
+	 * before it was whitelisted, so it must not be refused at the pooler edge.
+	 */
+	if (is_in_whitelist(username, max_auth_whitelist))
+		PG_RETURN_BOOL(false);
+
 	userid = get_role_oid(username, true);
 	if (userid == InvalidOid)
+		PG_RETURN_BOOL(false);
+
+	/*
+	 * Mirror credcheck_max_auth_failure(): with credcheck.reset_superuser the
+	 * hook lifts the ban of the bootstrap superuser at its next login, so the
+	 * pooler must let that login through instead of refusing it.
+	 */
+	if (reset_superuser && userid == BOOTSTRAP_SUPERUSERID)
 		PG_RETURN_BOOL(false);
 
 	key.roleid = userid;

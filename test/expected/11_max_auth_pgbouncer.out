@@ -64,6 +64,22 @@ SELECT failure_count, banned_date IS NOT NULL AS banned
              3 | t
 (1 row)
 
+-- A whitelisted role is never rejected by the hook, so it is not reported as
+-- banned to the pooler either, even with a failure entry recorded.
+SET credcheck.whitelist_auth_failure = 'ban_test';
+SELECT credcheck_is_banned('ban_test');             -- false (whitelisted)
+ credcheck_is_banned 
+---------------------
+ f
+(1 row)
+
+RESET credcheck.whitelist_auth_failure;
+SELECT credcheck_is_banned('ban_test');             -- true again
+ credcheck_is_banned 
+---------------------
+ t
+(1 row)
+
 -- Unknown roles are ignored (mirrors the hook).
 SELECT credcheck_record_auth_failure('does_not_exist');
  credcheck_record_auth_failure 
