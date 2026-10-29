@@ -38,18 +38,20 @@ CREATE USER issue93_victim PASSWORD 'Iss93Victim1!';
 \c - issue93
 ALTER USER issue93 PASSWORD 'Iss93PassWORD!';         -- error, reuse
 ERROR:  Cannot use this credential following the password reuse policy
-DROP USER issue93;                                    -- error, permission
-ERROR:  permission denied to drop role
-DETAIL:  Only roles with the CREATEROLE attribute and the ADMIN option on the target roles may drop roles.
+-- The wording of the permission errors depends on the PostgreSQL version:
+-- report only the SQLSTATE (42501, insufficient_privilege).
+DO $$ BEGIN DROP USER issue93;
+EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'DROP USER: %', SQLSTATE; END $$;
+NOTICE:  DROP USER: 42501
 ALTER USER issue93 PASSWORD 'Iss93PassWORD!';         -- still an error
 ERROR:  Cannot use this credential following the password reuse policy
 -- failing statements on another role must not touch its history
-CREATE USER issue93_victim PASSWORD 'Iss93Poison1!';  -- error, permission
-ERROR:  permission denied to create role
-DETAIL:  Only roles with the CREATEROLE attribute may create roles.
-ALTER USER issue93_victim PASSWORD 'Iss93Poison2!';   -- error, permission
-ERROR:  permission denied to alter role
-DETAIL:  To change another role's password, the current user must have the CREATEROLE attribute and the ADMIN option on the role.
+DO $$ BEGIN CREATE USER issue93_victim PASSWORD 'Iss93Poison1!';
+EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'CREATE USER: %', SQLSTATE; END $$;
+NOTICE:  CREATE USER: 42501
+DO $$ BEGIN ALTER USER issue93_victim PASSWORD 'Iss93Poison2!';
+EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'ALTER USER: %', SQLSTATE; END $$;
+NOTICE:  ALTER USER: 42501
 \c - postgres
 SELECT rolename, count(*) FROM pg_password_history
   WHERE rolename LIKE 'issue93%' GROUP BY rolename ORDER BY rolename;

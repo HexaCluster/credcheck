@@ -28,11 +28,16 @@ ALTER USER issue93 PASSWORD 'Iss93PassWORD!';         -- error, reuse
 CREATE USER issue93_victim PASSWORD 'Iss93Victim1!';
 \c - issue93
 ALTER USER issue93 PASSWORD 'Iss93PassWORD!';         -- error, reuse
-DROP USER issue93;                                    -- error, permission
+-- The wording of the permission errors depends on the PostgreSQL version:
+-- report only the SQLSTATE (42501, insufficient_privilege).
+DO $$ BEGIN DROP USER issue93;
+EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'DROP USER: %', SQLSTATE; END $$;
 ALTER USER issue93 PASSWORD 'Iss93PassWORD!';         -- still an error
 -- failing statements on another role must not touch its history
-CREATE USER issue93_victim PASSWORD 'Iss93Poison1!';  -- error, permission
-ALTER USER issue93_victim PASSWORD 'Iss93Poison2!';   -- error, permission
+DO $$ BEGIN CREATE USER issue93_victim PASSWORD 'Iss93Poison1!';
+EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'CREATE USER: %', SQLSTATE; END $$;
+DO $$ BEGIN ALTER USER issue93_victim PASSWORD 'Iss93Poison2!';
+EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'ALTER USER: %', SQLSTATE; END $$;
 \c - postgres
 SELECT rolename, count(*) FROM pg_password_history
   WHERE rolename LIKE 'issue93%' GROUP BY rolename ORDER BY rolename;
