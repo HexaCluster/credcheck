@@ -25,6 +25,7 @@ jobs:
     strategy:
       matrix:
         pgversion:
+          - 12
           - 13
           - 14
           - 15
@@ -69,3 +70,80 @@ jobs:
       if: ${{ failure() }}
       run: |
         cat regression.diffs
+
+  upgrade:
+    name: Upgrade PG${{ matrix.pgversion }} from ${{ matrix.from_version }}
+    runs-on: ubuntu-latest
+    needs: build
+
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pgversion: [13, 14, 15, 16, 17, 18, 19]
+        from_version: ['4.6.0', '5.0.0', '5.1.0']
+
+    env:
+      PGVERSION: ${{ matrix.pgversion }}
+      FROM_VERSION: ${{ matrix.from_version }}
+
+    steps:
+    - name: checkout
+      uses: actions/checkout@main
+
+    - name: Install GSSAPI development headers
+      run: |
+        sudo apt-get -y update
+        sudo apt-get -y install libkrb5-dev
+
+    - name: install pg
+      run: |
+        sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -v $PGVERSION -p -i
+        sudo -u postgres createuser -s "$USER"
+
+    - name: build
+      run: |
+        make PROFILE="-Werror"
+        sudo -E make install
+
+    - name: config
+      run: |
+        sudo pg_conftool $PGVERSION main set shared_preload_libraries credcheck
+        sudo sed -i '1i local   all   all   trust' /etc/postgresql/$PGVERSION/main/pg_hba.conf
+        sudo service postgresql restart
+
+    - name: test extension upgrade
+      env:
+        STATE_QUERY: |
+          SELECT 'function', p.oid::regprocedure::text, coalesce(p.proacl::text, '')
+          FROM pg_depend d
+          JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'credcheck'
+          JOIN pg_proc p ON p.oid = d.objid
+          WHERE d.classid = 'pg_proc'::regclass AND d.deptype = 'e'
+          UNION ALL
+          SELECT 'view', c.oid::regclass::text, coalesce(c.relacl::text, '')
+          FROM pg_depend d
+          JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'credcheck'
+          JOIN pg_class c ON c.oid = d.objid
+          WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'e' AND c.relkind = 'v'
+          ORDER BY 1, 2
+      run: |
+        TARGET_VERSION="$(awk -F "'" '/^default_version =/ { print $2 }' credcheck.control)"
+        sudo install -m 644 sql/credcheck--$FROM_VERSION.sql \
+          "$(pg_config --sharedir)/extension/credcheck--$FROM_VERSION.sql"
+        psql -d postgres -v ON_ERROR_STOP=1 \
+          -c "CREATE EXTENSION credcheck VERSION '$FROM_VERSION';" \
+          -c "ALTER EXTENSION credcheck UPDATE TO '$TARGET_VERSION';"
+        test "$(psql -d postgres -Atc \
+          "SELECT extversion FROM pg_extension WHERE extname = 'credcheck';")" = "$TARGET_VERSION"
+        psql -d postgres -v ON_ERROR_STOP=1 \
+          -c 'DROP DATABASE IF EXISTS credcheck_fresh;' \
+          -c 'CREATE DATABASE credcheck_fresh;'
+        psql -d credcheck_fresh -v ON_ERROR_STOP=1 \
+          -c "CREATE EXTENSION credcheck VERSION '$TARGET_VERSION';"
+        psql -d postgres -Atc "$STATE_QUERY" > /tmp/credcheck-upgraded.state
+        psql -d credcheck_fresh -Atc "$STATE_QUERY" > /tmp/credcheck-fresh.state
+        diff -u /tmp/credcheck-fresh.state /tmp/credcheck-upgraded.state
