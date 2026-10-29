@@ -10,6 +10,7 @@
 	- [Force password change](#force-password-change)
 	- [Prohibit password changes](#disallow-password-change)
 	- [Warning before password expire](#warning-before-password-expire)
+	- [Password masking in logs](#password-masking-in-logs)
 	- [Last login information](#last-login-information)
     - [Using max_auth_failure with PgBouncer](#using-max-auth-failure-with-pgbouncer)
 	- [Examples](#examples)
@@ -709,6 +710,45 @@ CREATE EVENT TRIGGER valid_until_warning
 ALTER EVENT TRIGGER valid_until_warning ENABLE ALWAYS;
 ```
 This DDL is also provided in the separated file `event_trigger.sql`.
+
+### [Password masking in logs](#password-masking-in-logs)
+
+When `credcheck.no_password_logging` is enabled (the default), credcheck masks
+passwords in the messages sent to the server log (statements logged by
+`log_statement` or `log_min_duration_statement`, the `STATEMENT:` line of an
+error, error details and context). Each character of the secret is replaced by a dot, for example:
+
+```
+LOG:  statement: CREATE ROLE alice LOGIN PASSWORD '............';
+```
+
+The text is scanned as SQL, so comments, quoted identifiers and ordinary data
+are not affected, and the following are masked:
+
+- the value of a `PASSWORD` clause written as a string literal (`'...'`,
+  `E'...'`) or a dollar-quoted string (`$tag$...$tag$`), which also covers
+  FDW options such as `OPTIONS (password '...')`;
+- the same clauses inside the body of a `DO` block, a routine body or any other
+  string literal or dollar-quoted string that contains the word `password`;
+- every literal argument of `pg_check_password()`, and named arguments called
+  `password` (`password => '...'`).
+
+Masking can only work on the text of the statement. It can not detect a
+password that is not written as the value of one of these constructs, for
+example:
+
+- a password given to a misspelled option (`PASSWORG '...'`), which is
+  rejected and logged as is;
+- a password passed to a user-defined function that wraps `pg_check_password()`
+  or that executes `ALTER ROLE`;
+- a password stored in a variable and used later, for example in a `DO` block
+  that builds the `CREATE ROLE` command with `format()`;
+- a password in a connection string, such as `dblink_connect('... password=...')`.
+
+The only way to never have a clear text password in a statement is to send it
+already encrypted, as psql's `\password` command does. Note that credcheck
+rejects an encrypted password unless `credcheck.encrypted_password_allowed` is
+enabled, and can not apply the password checks to it.
 
 ### [Limitations](#limitations)
 

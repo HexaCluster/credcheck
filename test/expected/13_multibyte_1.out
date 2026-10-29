@@ -1,0 +1,7 @@
+--
+-- Issue #91: length, character class and repeat rules count characters, not
+-- bytes, for multibyte encodings. Only meaningful in a UTF8 database.
+--
+SELECT getdatabaseencoding() <> 'UTF8' AS skip_test \gset
+\if :skip_test
+\quit

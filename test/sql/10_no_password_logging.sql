@@ -26,6 +26,21 @@ ALTER ROLE alice PASSWORD 'Zq3xK';
 SELECT 'my password is hunter2' AS note;
 /* set the password here */ CREATE ROLE carol LOGIN PASSWORD 'Comm3ntPwd!';
 
+-- Issue #88: dollar-quoted password value.
+CREATE ROLE erin LOGIN PASSWORD $mask_me$D0llarPwd!x$mask_me$;
+-- Issue #88: password inside a DO block, dollar-quoted or single-quoted.
+DO $$ BEGIN CREATE ROLE frank LOGIN PASSWORD 'D0blockPwd!'; END $$;
+DO 'BEGIN CREATE ROLE gina LOGIN PASSWORD ''D0quotedPwd!''; END';
+-- Issue #88: arguments of pg_check_password(), positional and named.
+SELECT pg_check_password('erin', 'Ch3ckedPwd!');
+SELECT pg_check_password(username => 'erin', password => 'Ch3ckedPwd!');
+-- Data mentioning "password" in a dollar-quoted string is left alone.
+SELECT $$the password is not here$$ AS note;
+-- A positional parameter is not a dollar quote.
+PREPARE p(text) AS SELECT $1 AS v, $$password '$$ AS w;
+EXECUTE p('keep me');
+DEALLOCATE p;
+
 -- Normal behavior when no_password_logging is disabled
 SET credcheck.no_password_logging = off;
 ALTER ROLE alice PASSWORD 'Zq3xK';
@@ -34,4 +49,7 @@ DROP ROLE alice;
 DROP ROLE bob;
 DROP ROLE dave;
 DROP ROLE carol;
+DROP ROLE erin;
+DROP ROLE frank;
+DROP ROLE gina;
 

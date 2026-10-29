@@ -4154,121 +4154,221 @@ query_has_password(const char *s)
 	return false;
 }
 
-/* Advance past whitespace. */
-static char *
-skip_ws(char *p)
+/*
+ * Password masking lexer (no_password_logging, pg_lastlog).
+ *
+ * The text is scanned as SQL so that the PASSWORD keyword is only matched as
+ * real SQL and not inside comments, quoted identifiers or ordinary data. The
+ * bodies of dollar-quoted strings and string literals that contain the word
+ * "password" are scanned again as SQL, so that a password in a DO block, a
+ * function body or EXECUTE text is masked too (issue #88). Inside a string
+ * literal a quote is written as two quotes, so a nested scan uses a quote
+ * length 'q' that doubles at each level: a literal at level q starts and ends
+ * with q quotes and an embedded quote is 2q quotes.
+ *
+ * Masking overwrites the characters of the secret with '.', in place: the
+ * length of the text never changes, which fix_log() relies on.
+ */
+#define MASK_MAX_DEPTH 4
+
+static void mask_sql(char *p, char *end, int q, int depth);
+
+/* Is there a run of at least n quotes at p? */
+static bool
+is_quote_run(const char *p, const char *end, int n)
 {
-	while (*p && isspace((unsigned char) *p))
-		p++;
-	return p;
+	if (end - p < n)
+		return false;
+	for (int i = 0; i < n; i++)
+		if (p[i] != '\'')
+			return false;
+	return true;
 }
 
-/* Skip constant SQL string literal.*/
-static char *
-skip_string(char *p, bool estr)
+/* Case-insensitive search of "passw" in [p, end). */
+static bool
+range_has_password(const char *p, const char *end)
 {
-	p++;  /* skip opening quote */
-	while (*p)
+	for (; end - p >= 5; p++)
 	{
-		if (estr && *p == '\\' && p[1] != '\0')
-		{
-			p += 2;
-			continue;
-		}
-		if (*p == '\'')
-		{
-			if (p[1] == '\'')
-			{
-				p += 2;
-				continue;
-			}
-			return p + 1;  /* closing quote */
-		}
-		p++;
+		if (pg_strncasecmp(p, "passw", 5) == 0)
+			return true;
 	}
+	return false;
+}
+
+static char *
+skip_ws(char *p, char *end)
+{
+	while (p < end && isspace((unsigned char) *p))
+		p++;
 	return p;
 }
 
 /*
- * Overwrite the interior of an SQL string literal with '.', preserving the
- * quotes and the literal's overall length. 'p' points at the opening quote.
- * Returns the position just past the closing quote.
+ * If p starts a dollar quote ($tag$ or $$), return a pointer to the first
+ * character of its body and set *taglen, otherwise return NULL. As in the
+ * PostgreSQL lexer the tag cannot start with a digit.
  */
 static char *
-mask_string_literal(char *p, bool estr)
+dollar_quote_start(char *p, char *end, size_t *taglen)
 {
-	p++;  /* keep opening quote */
-	while (*p)
-	{
-		if (estr && *p == '\\' && p[1] != '\0')
-		{
-			*p = '.';
-			p[1] = '.';
-			p += 2;
-			continue;
-		}
-		if (*p == '\'')
-		{
-			if (p[1] == '\'')  /* doubled quote -> embedded ' */
-			{
-				*p = '.';
-				p[1] = '.';
-				p += 2;
-				continue;
-			}
-			return p + 1;  /* keep closing quote */
-		}
-		*p = '.';
-		p++;
-	}
-	return p;
+	char	   *t = p + 1;
+
+	if (p >= end || *p != '$')
+		return NULL;
+	if (t < end && isdigit((unsigned char) *t))
+		return NULL;
+	while (t < end && (*t == '_' || isalnum((unsigned char) *t) || IS_HIGHBIT_SET(*t)))
+		t++;
+	if (t >= end || *t != '$')
+		return NULL;
+	*taglen = (size_t) (t - p) + 1;
+	return t + 1;
 }
 
 /*
- * Mask, in place, the value of every PASSWORD '<literal>' (and FDW-style
- * "password '<literal>'") clause found in the SQL text 's'. A small lexer is
- * used so that the PASSWORD keyword is only matched as real SQL: string
- * literals, dollar-quoted strings, quoted identifiers and comments are skipped
- * so the word "password" appearing inside ordinary data never triggers a
- * (corrupting) match.
+ * Find the end of a dollar-quoted body starting at 'body' and closed by the
+ * tag at 'tag'. Returns the position of the closing tag, or 'end'.
  */
+static char *
+dollar_quote_end(char *body, char *end, const char *tag, size_t taglen)
+{
+	for (; (size_t) (end - body) >= taglen; body++)
+	{
+		if (*body == '$' && strncmp(body, tag, taglen) == 0)
+			return body;
+	}
+	return end;
+}
+
+/*
+ * Handle a string literal of quote length q starting at p (on its first
+ * quote). The body is masked when 'mask' is true, otherwise scanned again as
+ * SQL if it may contain a password. Returns the position after the literal.
+ */
+static char *
+lex_string(char *p, char *end, int q, bool estr, bool mask, int depth)
+{
+	char	   *body = p + q;
+	char	   *b = body;
+
+	while (b < end)
+	{
+		if (estr && *b == '\\' && b + 1 < end)
+		{
+			if (mask)
+				b[0] = b[1] = '.';
+			b += 2;
+			continue;
+		}
+		if (is_quote_run(b, end, 2 * q))
+		{
+			/* embedded quote */
+			if (mask)
+				memset(b, '.', 2 * q);
+			b += 2 * q;
+			continue;
+		}
+		if (is_quote_run(b, end, q))
+		{
+			if (!mask && !estr && depth < MASK_MAX_DEPTH
+				&& range_has_password(body, b))
+				mask_sql(body, b, 2 * q, depth + 1);
+			return b + q;
+		}
+		if (mask)
+			*b = '.';
+		b++;
+	}
+	/* unterminated (for example truncated text): handled up to the end */
+	if (!mask && !estr && depth < MASK_MAX_DEPTH && range_has_password(body, end))
+		mask_sql(body, end, 2 * q, depth + 1);
+	return end;
+}
+
+/*
+ * Handle a dollar-quoted string starting at p. The body is masked when
+ * 'mask' is true, otherwise scanned again as SQL. Returns the position after
+ * the closing tag, or NULL if p does not start a dollar quote.
+ */
+static char *
+lex_dollar(char *p, char *end, int q, bool mask, int depth)
+{
+	size_t		taglen;
+	char	   *body = dollar_quote_start(p, end, &taglen);
+	char	   *close;
+
+	if (body == NULL)
+		return NULL;
+	close = dollar_quote_end(body, end, p, taglen);
+	if (mask)
+		memset(body, '.', close - body);
+	else if (depth < MASK_MAX_DEPTH && range_has_password(body, close))
+		mask_sql(body, close, q, depth + 1);
+	return (close < end) ? close + taglen : end;
+}
+
+/*
+ * Mask the value following a PASSWORD keyword (or a "password" named
+ * argument) if it is a literal. Returns the position to continue from.
+ */
+static char *
+mask_password_value(char *p, char *end, int q, int depth)
+{
+	char	   *lit = skip_ws(p, end);
+	char	   *next;
+
+	/* named argument: password => '...' / password := '...' */
+	if (end - lit >= 2 && ((lit[0] == '=' && lit[1] == '>') ||
+						   (lit[0] == ':' && lit[1] == '=')))
+		lit = skip_ws(lit + 2, end);
+
+	if (lit < end && (*lit == 'E' || *lit == 'e') && is_quote_run(lit + 1, end, q))
+		return lex_string(lit + 1, end, q, true, true, depth);
+	if (is_quote_run(lit, end, q))
+		return lex_string(lit, end, q, false, true, depth);
+	if ((next = lex_dollar(lit, end, q, true, depth)) != NULL)
+		return next;
+	/* PASSWORD NULL / PASSWORD $1 / ...: nothing to mask */
+	return p;
+}
+
 static void
-mask_passwords(char *s)
+mask_sql(char *p, char *end, int q, int depth)
 {
-	char *p = s;
+	int			paren = 0;
+	int			mask_paren = -1;	/* inside pg_check_password(...) */
 
-	if (s == NULL)
-		return;
-
-	while (*p)
+	while (p < end)
 	{
 		unsigned char c = (unsigned char) *p;
+		char	   *next;
 
 		/* line comment */
-		if (c == '-' && p[1] == '-')
+		if (c == '-' && p + 1 < end && p[1] == '-')
 		{
-			p += 2;
-			while (*p && *p != '\n')
+			while (p < end && *p != '\n')
 				p++;
 			continue;
 		}
 
 		/* block comment (PostgreSQL allows nesting) */
-		if (c == '/' && p[1] == '*')
+		if (c == '/' && p + 1 < end && p[1] == '*')
 		{
-			int depth = 1;
+			int			cdepth = 1;
 
 			p += 2;
-			while (*p && depth > 0)
+			while (p < end && cdepth > 0)
 			{
-				if (p[0] == '/' && p[1] == '*')
+				if (p + 1 < end && p[0] == '/' && p[1] == '*')
 				{
-					depth++;
+					cdepth++;
 					p += 2;
 				}
-				else if (p[0] == '*' && p[1] == '/')
+				else if (p + 1 < end && p[0] == '*' && p[1] == '/')
 				{
-					depth--;
+					cdepth--;
 					p += 2;
 				}
 				else
@@ -4281,11 +4381,11 @@ mask_passwords(char *s)
 		if (c == '"')
 		{
 			p++;
-			while (*p)
+			while (p < end)
 			{
 				if (*p == '"')
 				{
-					if (p[1] == '"')
+					if (p + 1 < end && p[1] == '"')
 					{
 						p += 2;
 						continue;
@@ -4298,85 +4398,93 @@ mask_passwords(char *s)
 			continue;
 		}
 
-		/* dollar-quoted string: $tag$ ... $tag$ */
-		if (c == '$')
+		/* dollar-quoted string */
+		if (c == '$' && (next = lex_dollar(p, end, q, mask_paren >= 0, depth)) != NULL)
 		{
-			char	*tagend = p + 1;
-
-			while (*tagend &&
-				   (*tagend == '_' || isalnum((unsigned char) *tagend)))
-				tagend++;
-
-			if (*tagend == '$')
-			{
-				size_t	  taglen = (size_t) (tagend - p) + 1;
-				char	*body = tagend + 1;
-
-				for (; *body; body++)
-				{
-					if (*body == '$' && strncmp(body, p, taglen) == 0)
-					{
-						body += taglen;
-						break;
-					}
-				}
-				p = body;
-				continue;
-			}
-			/* not a dollar quote */
-			p++;
+			p = next;
 			continue;
 		}
 
-		/* ordinary string literal */
-		if (c == '\'')
+		/* string literal */
+		if (is_quote_run(p, end, q))
 		{
-			p = skip_string(p, false);
+			p = lex_string(p, end, q, false, mask_paren >= 0, depth);
+			continue;
+		}
+
+		if (c == '(')
+		{
+			paren++;
+			p++;
+			continue;
+		}
+		if (c == ')')
+		{
+			if (paren == mask_paren)
+				mask_paren = -1;
+			if (paren > 0)
+				paren--;
+			p++;
 			continue;
 		}
 
 		/* identifier or keyword */
-		if (c == '_' || isalpha(c))
+		if (c == '_' || isalpha(c) || IS_HIGHBIT_SET(c))
 		{
-			char	*start = p;
-			size_t	  len;
+			char	   *start = p;
+			size_t		len;
 
 			p++;
-			while (*p == '_' || *p == '$' || isalnum((unsigned char) *p))
+			while (p < end && (*p == '_' || *p == '$' || isalnum((unsigned char) *p)
+							   || IS_HIGHBIT_SET(*p)))
 				p++;
 			len = (size_t) (p - start);
 
-			/* E'...' / e'...' escape string constant */
-			if (len == 1 && (start[0] == 'E' || start[0] == 'e') &&
-				*p == '\'')
+			/* E'...' escape string constant */
+			if (len == 1 && (start[0] == 'E' || start[0] == 'e')
+				&& is_quote_run(p, end, q))
 			{
-				p = skip_string(p, true);
+				p = lex_string(p, end, q, true, mask_paren >= 0, depth);
 				continue;
 			}
 
 			if (len == 8 && pg_strncasecmp(start, "password", 8) == 0)
 			{
-				char	*lit = skip_ws(p);
-				bool	    estr = false;
+				p = mask_password_value(p, end, q, depth);
+				continue;
+			}
 
-				if ((*lit == 'E' || *lit == 'e') && lit[1] == '\'')
-				{
-					estr = true;
-					lit++;
-				}
+			/* every literal argument of pg_check_password() is masked */
+			if (len == 17 && pg_strncasecmp(start, "pg_check_password", 17) == 0)
+			{
+				char	   *lp = skip_ws(p, end);
 
-				if (*lit == '\'')
+				if (lp < end && *lp == '(' && mask_paren < 0)
 				{
-					/* PASSWORD 'secret'  ->  PASSWORD '......' */
-					p = mask_string_literal(lit, estr);
-					continue;
+					paren++;
+					mask_paren = paren;
+					p = lp + 1;
 				}
-				/* PASSWORD NULL / PASSWORD $n / etc: nothing to mask */
 			}
 			continue;
 		}
 		p++;
 	}
+}
+
+/*
+ * Mask, in place, the passwords found in the SQL text 's': the value of every
+ * PASSWORD '<literal>' clause (including FDW-style "password '<literal>'"
+ * options and dollar-quoted values), the same inside DO blocks, routine
+ * bodies and other string literals, and the arguments of pg_check_password().
+ */
+static void
+mask_passwords(char *s)
+{
+	if (s == NULL)
+		return;
+
+	mask_sql(s, s + strlen(s), 1, 0);
 }
 
 static void
