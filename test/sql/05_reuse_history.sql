@@ -24,3 +24,13 @@ DROP USER credtest;
 SELECT * FROM pg_password_history WHERE rolename = 'credtest';
 -- Reset the password history
 SELECT pg_password_history_reset();
+
+-- The history follows the role even when the reuse policy is not set in the
+-- session that renames or drops it (the policy can be set per role).
+SET credcheck.password_reuse_history = 2;
+CREATE USER credtest_rn WITH PASSWORD 'H8Hdre=S2';
+RESET credcheck.password_reuse_history;
+ALTER USER credtest_rn RENAME TO credtest_rn2;
+SELECT rolename FROM pg_password_history WHERE rolename LIKE 'credtest_rn%';
+DROP USER credtest_rn2;
+SELECT count(*) FROM pg_password_history WHERE rolename LIKE 'credtest_rn%';

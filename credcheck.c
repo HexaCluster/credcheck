@@ -1543,9 +1543,12 @@ rename_user_in_history(const char *username, const char *newname)
 	int32	_i;
 	int	 num_changed = 0;
 
-	if (password_reuse_history == 0 && password_reuse_interval == 0)
-		return;
-
+	/*
+	 * Always follow the role, even when the reuse policy is not enabled in
+	 * this session: the policy GUCs can be set per role or per session, and
+	 * entries left behind would be inherited by a future role with the same
+	 * name.
+	 */
 	Assert(username != NULL);
 	Assert(newname != NULL);
 
@@ -1739,9 +1742,12 @@ remove_user_from_history(const char *username)
 	pgphEntry  *entry;
 	int32	_i;
 
-	if (password_reuse_history == 0 && password_reuse_interval == 0)
-		return;
-
+	/*
+	 * Always follow the role, even when the reuse policy is not enabled in
+	 * this session: the policy GUCs can be set per role or per session, and
+	 * entries left behind would be inherited by a future role with the same
+	 * name.
+	 */
 	Assert(username != NULL);
 
 	/* Safety check ... shouldn't get here unless shmem is set up. */
