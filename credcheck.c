@@ -4499,10 +4499,11 @@ PG_FUNCTION_INFO_V1(credcheck_record_auth_failure);
  * single max_auth_failure setting governs both direct and pooled connections.
  *
  * Returns the new failure count for the role, or 0 when the feature is disabled,
- * the role is whitelisted, or the role does not exist. It is privileged (only a
- * superuser may call it) so that an unprivileged user cannot ban other roles;
- * the operator additionally REVOKEs it from PUBLIC and GRANTs EXECUTE to the
- * trusted reporting role only.
+ * the role is whitelisted, or the role does not exist. It can ban any role, so
+ * the extension scripts REVOKE it from PUBLIC: access is controlled by the
+ * EXECUTE privilege, which the operator GRANTs to the trusted reporting role
+ * only (e.g. the fail2ban database user), so that reporter does not need to be
+ * a superuser.
  */
 Datum
 credcheck_record_auth_failure(PG_FUNCTION_ARGS)
@@ -4512,9 +4513,6 @@ credcheck_record_auth_failure(PG_FUNCTION_ARGS)
 	pgafHashKey key;
 	pgafEntry  *entry;
 	float	fail_cnt = 1;
-
-	if (!superuser())
-		ereport(ERROR, (errmsg("only superuser can record authentication failures")));
 
 	username = NameStr(*(PG_GETARG_NAME(0)));
 
