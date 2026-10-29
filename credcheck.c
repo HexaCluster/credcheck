@@ -2776,6 +2776,17 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 	Oid     save_userid;
 	int     save_sec_context;
 
+	/*
+	 * Changes to the password history are only applied once the statement
+	 * has succeeded, otherwise a statement rejected by PostgreSQL (permission
+	 * denied, role already exists, ...) could still alter them (issue #93).
+	 */
+	char	   *hist_save_user = NULL;
+	char	   *hist_save_password = NULL;
+	char	   *hist_rename_old = NULL;
+	char	   *hist_rename_new = NULL;
+	List	   *hist_drop_users = NIL;
+
 	elog(DEBUG1, "Start cc_ProcessUtility()");
 
 	/* If real user connection and top level (not SPI re-enter, etc) */
@@ -2844,8 +2855,9 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 					username_check(stmt->newname, NULL);
 
 #if PG_VERSION_NUM >= 120000
-					/* rename the user in the history table */
-					rename_user_in_history(stmt->subname, stmt->newname);
+					/* rename the user in the history table once renamed */
+					hist_rename_old = pstrdup(stmt->subname);
+					hist_rename_new = pstrdup(stmt->newname);
 #endif
 				}
 				break;
@@ -2983,9 +2995,12 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				}
 
 #if PG_VERSION_NUM >= 120000
-				/* The password can be saved into the history */
+				/* The password will be saved into the history on success */
 				if (save_password)
-					save_password_in_history(stmt->role->rolename, password);
+				{
+					hist_save_user = pstrdup(stmt->role->rolename);
+					hist_save_password = pstrdup(password);
+				}
 #endif
 				if (force_change_password)
 				{
@@ -3111,9 +3126,12 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 							errmsg(gettext_noop("require a VALID UNTIL option with a date NOT beyond %d days"), password_valid_max)));
 
 #if PG_VERSION_NUM >= 120000
-				/* The password can be saved into the history */
+				/* The password will be saved into the history on success */
 				if (save_password)
-					save_password_in_history(stmt->role, password);
+				{
+					hist_save_user = pstrdup(stmt->role);
+					hist_save_password = pstrdup(password);
+				}
 #endif
 				strcpy(load_roleid, stmt->role);
 
@@ -3126,11 +3144,14 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				DropRoleStmt *stmt = (DropRoleStmt *)parsetree;
 				ListCell   *item;
 
+				/* the history is removed only once the roles are dropped */
 				foreach(item, stmt->roles)
 				{
 					RoleSpec   *rolspec = lfirst(item);
 
-					remove_user_from_history(rolspec->rolename);
+					if (rolspec->rolename != NULL)
+						hist_drop_users = lappend(hist_drop_users,
+												  pstrdup(rolspec->rolename));
 				}
 				break;
 			}
@@ -3159,6 +3180,21 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 	/* Restore user's privileges */
 	if (use_superuser_priv)
 		SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	/* The statement succeeded, apply the deferred history changes. */
+#if PG_VERSION_NUM >= 120000
+	if (hist_save_user != NULL)
+		save_password_in_history(hist_save_user, hist_save_password);
+	if (hist_rename_old != NULL)
+		rename_user_in_history(hist_rename_old, hist_rename_new);
+	if (hist_drop_users != NIL)
+	{
+		ListCell   *item;
+
+		foreach(item, hist_drop_users)
+			remove_user_from_history((char *) lfirst(item));
+	}
+#endif
 
 	if (MyProcPort != NULL && context == PROCESS_UTILITY_TOPLEVEL && NOT_IN_PARALLEL_WORKER)
 	{
