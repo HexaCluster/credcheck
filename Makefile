@@ -23,12 +23,18 @@ TESTS = 01_username 02_password 03_rename 04_alter_pwd \
 
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 
+PG_CONFIG = pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+
+# pg_isolation_regress is installed for out-of-tree use since PostgreSQL 14
+# only; distro packages for older majors (e.g. PGDG 12/13) do not ship it,
+# so run the isolation test only where the tool exists.
+PG_ISOLATION_REGRESS := $(dir $(PGXS))../../src/test/isolation/pg_isolation_regress
+ifeq ($(shell test -x "$(PG_ISOLATION_REGRESS)" && echo yes),yes)
 ISOLATION = history_concurrent
 ISOLATION_OPTS = --inputdir=test --load-extension=credcheck
-
-PG_CONFIG = pg_config
+endif
 
 TAP_TESTS = 1
 
-PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

@@ -69,7 +69,7 @@ jobs:
     - name: show regression diffs
       if: ${{ failure() }}
       run: |
-        cat regression.diffs
+        cat regression.diffs 2>/dev/null || true
 
   upgrade:
     name: Upgrade PG${{ matrix.pgversion }} from ${{ matrix.from_version }}
