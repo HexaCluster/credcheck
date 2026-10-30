@@ -2222,7 +2222,8 @@ check_password(const char *username, const char *password,
 			break;
 		}
 		default:
-			if (!encrypted_password_allowed)
+			/* pg_upgrade restores verifiers already accepted by the old cluster */
+			if (!encrypted_password_allowed && !IsBinaryUpgrade)
 				ereport(ERROR,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg(gettext_noop("password type is not a plain text"))));
@@ -3312,8 +3313,10 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				/*
 				 * when the user change his password, automatically set the valid until
 				 * date to now() + password_valid_until days if password_valid_until is set.
+				 * pg_upgrade restores rolvaliduntil as catalog data, so binary upgrade
+				 * behaves as if the VALID UNTIL policy GUCs were 0.
 				 */
-				if (!dvalidUntil && password_valid_until > 0)
+				if (!dvalidUntil && password_valid_until > 0 && !IsBinaryUpgrade)
 				{
 					Timestamp dt_now = GetCurrentTimestamp();
 					struct pg_tm tt, *tm = &tt;
@@ -3356,7 +3359,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				}
 
 				/* when a valid until date is set check that it is > to password_valid_until */
-				if (dvalidUntil && dvalidUntil->arg && password_valid_until > 0)
+				if (dvalidUntil && dvalidUntil->arg && password_valid_until > 0 && !IsBinaryUpgrade)
 				{
 					int valid_until = check_valid_until(strVal(dvalidUntil->arg));
 					if (valid_until < password_valid_until)
@@ -3365,7 +3368,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 								errmsg(gettext_noop("the VALID UNTIL option must have a date older than %d days"), password_valid_until)));
 				}
 				/* check that the valid until date is not under the limit of days */
-				if (dvalidUntil && dvalidUntil->arg)
+				if (dvalidUntil && dvalidUntil->arg && !IsBinaryUpgrade)
 				{
 					int valid_max = check_valid_until(strVal(dvalidUntil->arg));
 					if (password_valid_until > 0 && valid_max < password_valid_until)
@@ -3407,9 +3410,13 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				 * roles (so users must change their password quickly) while
 				 * keeping a longer password_valid_until window for existing
 				 * roles that change their password (see issue #77).
+				 * pg_upgrade restores rolvaliduntil as catalog data, so binary
+				 * upgrade behaves as if the VALID UNTIL policy GUCs were 0.
 				 */
-				int	     create_valid = (password_valid_min > 0) ?
+				int	     create_valid = IsBinaryUpgrade ? 0 :
+										(password_valid_min > 0) ?
 										password_valid_min : password_valid_until;
+				int	     max_valid = IsBinaryUpgrade ? 0 : password_valid_max;
 				bool	    save_password = false;
 				char	   *password;
 				DefElem    *dpassword = NULL;
@@ -3483,14 +3490,14 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 					valid_until = check_valid_until(strVal(dvalidUntil->arg));
 					has_valid_until = true;
 				}
-				if (dvalidUntil && dvalidUntil->arg && password_valid_max > 0)
+				if (dvalidUntil && dvalidUntil->arg && max_valid > 0)
 				{
 					valid_max = check_valid_until(strVal(dvalidUntil->arg));
 					has_valid_until = true;
 				}
 
 				/* check that a VALID UNTIL option is present */
-				if ( !has_valid_until && (create_valid > 0 || password_valid_max > 0) )
+				if ( !has_valid_until && (create_valid > 0 || max_valid > 0) )
 					ereport(ERROR,
 						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 							errmsg(gettext_noop("require a VALID UNTIL option"))));
@@ -3502,10 +3509,10 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 							errmsg(gettext_noop("require a VALID UNTIL option with a date older than %d days"), create_valid)));
 
 				/* check that we do not exceed the number of days for password validity */
-				if (password_valid_max > 0 && valid_max > password_valid_max)
+				if (max_valid > 0 && valid_max > max_valid)
 					ereport(ERROR,
 						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-							errmsg(gettext_noop("require a VALID UNTIL option with a date NOT beyond %d days"), password_valid_max)));
+							errmsg(gettext_noop("require a VALID UNTIL option with a date NOT beyond %d days"), max_valid)));
 
 #if PG_VERSION_NUM >= 120000
 				/* The password will be saved into the history on success */
