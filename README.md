@@ -30,6 +30,7 @@ The `credcheck` PostgreSQL extension provides few general credential checks, whi
 - enforce use of an expiration date with a minimum of day for a password
 - define a password reuse policy
 - define the number of authentication failure allowed before a user is banned
+- deny logins during some hours of the day or on some days of the week
 - force users to change their password after first login
 - throw a warning N days before when the password user is about to expire
 
@@ -651,6 +652,73 @@ If you want to exclude some users from being banned, like application users for 
 ### [Authentication delay](#authentication-delay)
 
 This feature allow a pause on authentication failure. Setting `credcheck.auth_delay_ms` causes the server to pause for a given number of milliseconds before reporting authentication failure. This makes brute-force attacks on database passwords more difficult. 
+
+### [Login time restrictions](#login-time-restrictions)
+
+Logins can be refused during some hours of the day and/or on some days of the
+week, for example outside office hours or during the weekend. All roles are
+concerned except those listed in a dedicated whitelist.
+
+| Setting | Description | Example |
+|---------|-------------|---------|
+| `credcheck.login_denied_hours` | comma separated list of `HH:MM-HH:MM` time ranges during which logins are refused. The start of a range is included, the end is excluded, `24:00` is accepted as an end. A range can cross midnight. | `'20:00-07:00, 12:30-13:30'` |
+| `credcheck.login_denied_days` | comma separated list of week days during which logins are refused: `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun` (or the full English day names, case insensitive). Ranges like `mon-fri` are accepted and can wrap around the end of the week, e.g. `fri-mon`. | `'sat,sun'` |
+| `credcheck.whitelist_login_time` | comma separated list of roles that are never refused by these rules. | `'postgres,backup'` |
+
+The two rules are independent: a login is refused when the current day is
+denied **or** when the current time falls in one of the denied ranges. An
+empty value, the default, disables the rule. For example, to refuse logins
+from 8pm to 7am and the whole weekend, except for the `postgres` and
+`backup` roles:
+```
+credcheck.login_denied_hours = '20:00-07:00'
+credcheck.login_denied_days = 'sat,sun'
+credcheck.whitelist_login_time = 'postgres,backup'
+```
+
+These settings can only be set in `postgresql.conf` (or with `ALTER SYSTEM`)
+and take effect on configuration reload. They cannot be set per role or per
+database (`ALTER ROLE ... SET`) because such settings are applied after
+authentication. An invalid value is rejected at reload time.
+
+The check is done once the user has been successfully authenticated, so a
+client that fails to authenticate gets the usual authentication error and
+learns nothing about the policy. A refused login reports:
+```
+FATAL:  rejecting connection, user 'alice' is not allowed to connect at this time
+```
+and the server log explains which rule matched, for example
+`DETAIL:  Logins are denied on sat by credcheck.login_denied_days.`.
+A refused login is neither counted as an authentication failure by
+`credcheck.max_auth_failure` nor does it reset the failure counter, and it is
+not recorded in the last login history.
+
+Notes:
+
+- Replication connections (physical and logical walsenders) are **never**
+  refused, whatever the role, so standbys and logical replication
+  subscribers keep working during the denied periods. Be aware that a logical
+  replication connection (`replication=database`) also accepts regular SQL
+  queries, logical replication subscribers need it. A role having the
+  `REPLICATION` attribute, and allowed by a `replication` line of
+  `pg_hba.conf`, can therefore run SQL during a denied period through such a
+  connection. Grant `REPLICATION` only to dedicated replication roles and
+  restrict the `replication` entries of `pg_hba.conf` accordingly.
+- The current day and time are evaluated in the server timezone, the
+  `timezone` setting of the PostgreSQL configuration; the timezone sent by the
+  client is not taken into account. Make sure it matches the timezone the
+  policy is expressed in, daylight saving time changes included.
+- There is no implicit exception for superusers: add them to
+  `credcheck.whitelist_login_time` if they must always be able to connect.
+  If all superusers are excluded from the whitelist, nobody can connect to
+  change the setting during a denied period, except through a replication
+  connection; you will have to edit the configuration file and reload.
+- Only new logins are checked: sessions already opened when a denied period
+  starts are not terminated.
+- With a connection pooler such as PgBouncer, the check applies when the pooler
+  opens a server connection. A client served by an already opened server
+  connection is not checked; limit `server_lifetime` and
+  `server_idle_timeout` in the pooler if this matters.
 
 ### [Force password change](#force-password-change)
 

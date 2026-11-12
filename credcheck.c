@@ -60,6 +60,8 @@
 #include "nodes/pg_list.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/bgworker.h"
+#include "replication/walsender.h"
+#include "pgtime.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -505,6 +507,29 @@ static bool username_ignore_case = false;
 static char *username_whitelist = NULL;
 static char *max_auth_whitelist = NULL;
 
+/*
+ * Login time restrictions: credcheck.login_denied_hours,
+ * credcheck.login_denied_days and credcheck.whitelist_login_time.
+ * The raw strings are parsed once by the check hooks into the structures
+ * below (GUC "extra" data), so nothing is parsed at login time.
+ */
+#define LT_MAX_RANGES	64
+typedef struct LoginDeniedHours
+{
+	int		nranges;
+	struct
+	{
+		int		start;		/* minutes since midnight, inclusive */
+		int		end;		/* minutes since midnight, exclusive */
+	}		ranges[FLEXIBLE_ARRAY_MEMBER];
+} LoginDeniedHours;
+
+static char *login_denied_hours = NULL;
+static char *login_denied_days = NULL;
+static char *login_time_whitelist = NULL;
+static LoginDeniedHours *login_denied_hours_parsed = NULL;
+static int	login_denied_days_mask = 0;	/* bit n set = tm_wday n denied, 0 = sunday */
+
 /* Password flags*/
 static int password_min_length = 1;
 static int password_min_special = 0;
@@ -541,6 +566,11 @@ char *str_to_sha256(const char *str, const char *salt);
 
 bool check_whitelist(char **newval, void **extra, GucSource source);
 bool is_in_whitelist(char *username, char *whitelist);
+static bool check_login_denied_hours(char **newval, void **extra, GucSource source);
+static void assign_login_denied_hours(const char *newval, void *extra);
+static bool check_login_denied_days(char **newval, void **extra, GucSource source);
+static void assign_login_denied_days(const char *newval, void *extra);
+static void check_login_time(Port *port);
 
 /*
  * Lower-case a string following the database collation, as lower() does, so
@@ -868,6 +898,274 @@ is_in_whitelist(char *username, char *whitelist)
 	pfree(rawstring);
 
 	return false;
+}
+
+/*
+ * Parse one "HH:MM" token; "24:00" is only accepted when allow_24 is true.
+ * Returns the number of minutes since midnight or -1 on error.
+ */
+static int
+parse_hhmm(const char *str, bool allow_24)
+{
+	int		h, m, n = 0;
+
+	if (strlen(str) != 5 || !isdigit((unsigned char) str[0]) ||
+		!isdigit((unsigned char) str[1]) || str[2] != ':' ||
+		!isdigit((unsigned char) str[3]) || !isdigit((unsigned char) str[4]))
+		return -1;
+	if (sscanf(str, "%2d:%2d%n", &h, &m, &n) != 2 || n != 5)
+		return -1;
+	if (m > 59)
+		return -1;
+	if (h == 24 && m == 0 && allow_24)
+		return 24 * 60;
+	if (h > 23)
+		return -1;
+	return h * 60 + m;
+}
+
+static bool
+check_login_denied_hours(char **newval, void **extra, GucSource source)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *l;
+	LoginDeniedHours *parsed;
+	int			starts[LT_MAX_RANGES];
+	int			ends[LT_MAX_RANGES];
+	int			i = 0;
+
+	rawstring = pstrdup(*newval);
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+	if (list_length(elemlist) > LT_MAX_RANGES)
+	{
+		GUC_check_errdetail("At most %d time ranges are allowed.", LT_MAX_RANGES);
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	foreach(l, elemlist)
+	{
+		char	   *tok = (char *) lfirst(l);
+		char	   *dash = strchr(tok, '-');
+		int			start, end;
+
+		if (dash == NULL)
+			start = end = -1;
+		else
+		{
+			*dash = '\0';
+			start = parse_hhmm(tok, false);
+			end = parse_hhmm(dash + 1, true);
+			*dash = '-';
+		}
+		if (start < 0 || end < 0)
+		{
+			GUC_check_errdetail("Invalid time range \"%s\", expected HH:MM-HH:MM.", tok);
+			pfree(rawstring);
+			list_free(elemlist);
+			return false;
+		}
+		if (start == end)
+		{
+			GUC_check_errdetail("Time range \"%s\" is empty, use 00:00-24:00 for a whole day.", tok);
+			pfree(rawstring);
+			list_free(elemlist);
+			return false;
+		}
+		starts[i] = start;
+		ends[i] = end;
+		i++;
+	}
+	pfree(rawstring);
+	list_free(elemlist);
+
+	/*
+	 * Allocate the result only once the whole value is known to be valid:
+	 * guc_malloc() memory must not be released with free() from PostgreSQL 16
+	 * on (it lives in a GUC memory context), so never allocate before an
+	 * error exit.
+	 */
+	parsed = (LoginDeniedHours *) guc_malloc(LOG,
+						offsetof(LoginDeniedHours, ranges) +
+						Max(i, 1) * sizeof(parsed->ranges[0]));
+	if (parsed == NULL)
+		return false;
+	parsed->nranges = i;
+	while (--i >= 0)
+	{
+		parsed->ranges[i].start = starts[i];
+		parsed->ranges[i].end = ends[i];
+	}
+	*extra = (void *) parsed;
+	return true;
+}
+
+static void
+assign_login_denied_hours(const char *newval, void *extra)
+{
+	login_denied_hours_parsed = (LoginDeniedHours *) extra;
+}
+
+/* Return the tm_wday number (0 = sunday) of a day name, or -1 */
+static int
+parse_weekday(const char *str)
+{
+	static const char *const short_names[] = {"sun", "mon", "tue", "wed", "thu", "fri", "sat"};
+	static const char *const long_names[] = {"sunday", "monday", "tuesday",
+		"wednesday", "thursday", "friday", "saturday"};
+	int		d;
+
+	for (d = 0; d < 7; d++)
+	{
+		if (pg_strcasecmp(str, short_names[d]) == 0 ||
+			pg_strcasecmp(str, long_names[d]) == 0)
+			return d;
+	}
+	return -1;
+}
+
+static bool
+check_login_denied_days(char **newval, void **extra, GucSource source)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *l;
+	int			mask = 0;
+	int		   *parsed;
+
+	rawstring = pstrdup(*newval);
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	foreach(l, elemlist)
+	{
+		char	   *tok = (char *) lfirst(l);
+		char	   *dash = strchr(tok, '-');
+		int			first, last;
+
+		if (dash != NULL)
+		{
+			*dash = '\0';
+			first = parse_weekday(tok);
+			last = parse_weekday(dash + 1);
+			*dash = '-';
+		}
+		else
+			first = last = parse_weekday(tok);
+
+		if (first < 0 || last < 0)
+		{
+			GUC_check_errdetail("Invalid week day \"%s\", expected mon, tue, wed, thu, fri, sat, sun or a range like mon-fri.", tok);
+			pfree(rawstring);
+			list_free(elemlist);
+			return false;
+		}
+		/* a range can wrap around the end of the week, e.g. fri-mon */
+		for (;;)
+		{
+			mask |= (1 << first);
+			if (first == last)
+				break;
+			first = (first + 1) % 7;
+		}
+	}
+	pfree(rawstring);
+	list_free(elemlist);
+
+	parsed = (int *) guc_malloc(LOG, sizeof(int));
+	if (parsed == NULL)
+		return false;
+	*parsed = mask;
+	*extra = (void *) parsed;
+	return true;
+}
+
+static void
+assign_login_denied_days(const char *newval, void *extra)
+{
+	login_denied_days_mask = extra ? *((int *) extra) : 0;
+}
+
+/*
+ * Reject the connection with a FATAL error if the current day or time is
+ * denied by credcheck.login_denied_days or credcheck.login_denied_hours.
+ * Replication connections (physical and logical walsenders) are never
+ * refused, and roles listed in credcheck.whitelist_login_time are exempted.
+ * The current time is evaluated in the server timezone (the timezone set in
+ * the configuration); client-supplied settings are not applied yet when the
+ * authentication hook is called.
+ */
+static void
+check_login_time(Port *port)
+{
+	pg_time_t	now;
+	struct pg_tm *tm;
+	int			minutes;
+	int			i;
+	static const char *const day_names[] = {"sun", "mon", "tue", "wed", "thu", "fri", "sat"};
+
+	if (login_denied_days_mask == 0 &&
+		(login_denied_hours_parsed == NULL || login_denied_hours_parsed->nranges == 0))
+		return;
+
+	/* never block replication */
+	if (am_walsender)
+		return;
+
+	if (port->user_name == NULL ||
+		is_in_whitelist(port->user_name, login_time_whitelist))
+		return;
+
+	now = timestamptz_to_time_t(GetCurrentTimestamp());
+	tm = pg_localtime(&now, session_timezone);
+	if (tm == NULL)
+		return;
+	minutes = tm->tm_hour * 60 + tm->tm_min;
+
+	if (login_denied_days_mask & (1 << tm->tm_wday))
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+				 errmsg("rejecting connection, user '%s' is not allowed to connect at this time",
+						port->user_name),
+				 errdetail_log("Logins are denied on %s by credcheck.login_denied_days.",
+							   day_names[tm->tm_wday])));
+
+	if (login_denied_hours_parsed == NULL)
+		return;
+
+	for (i = 0; i < login_denied_hours_parsed->nranges; i++)
+	{
+		int		start = login_denied_hours_parsed->ranges[i].start;
+		int		end = login_denied_hours_parsed->ranges[i].end;
+		bool	denied;
+
+		if (start < end)
+			denied = (minutes >= start && minutes < end);
+		else					/* range crossing midnight */
+			denied = (minutes >= start || minutes < end);
+
+		if (denied)
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					 errmsg("rejecting connection, user '%s' is not allowed to connect at this time",
+							port->user_name),
+					 errdetail_log("Logins are denied from %02d:%02d to %02d:%02d by credcheck.login_denied_hours, server time is %02d:%02d.",
+								   start / 60, start % 60, end / 60, end % 60,
+								   tm->tm_hour, tm->tm_min)));
+	}
 }
 
 
@@ -2946,6 +3244,26 @@ _PG_init(void)
 				gettext_noop("comma separated list of username to exclude from max authentication failure check"), NULL,
 				&max_auth_whitelist, "", PGC_SUSET, 0, check_whitelist, NULL, NULL);
 
+	DefineCustomStringVariable(
+				"credcheck.login_denied_hours",
+				gettext_noop("comma separated list of HH:MM-HH:MM time ranges"
+				" during which logins are refused"), NULL,
+				&login_denied_hours, "", PGC_SIGHUP, 0,
+				check_login_denied_hours, assign_login_denied_hours, NULL);
+
+	DefineCustomStringVariable(
+				"credcheck.login_denied_days",
+				gettext_noop("comma separated list of week days (mon..sun, ranges"
+				" like mon-fri allowed) during which logins are refused"), NULL,
+				&login_denied_days, "", PGC_SIGHUP, 0,
+				check_login_denied_days, assign_login_denied_days, NULL);
+
+	DefineCustomStringVariable(
+				"credcheck.whitelist_login_time",
+				gettext_noop("comma separated list of username to exclude from"
+				" the login time restrictions"), NULL,
+				&login_time_whitelist, "", PGC_SIGHUP, 0, check_whitelist, NULL, NULL);
+
 #if PG_VERSION_NUM < 150000
 	EmitWarningsOnPlaceholders("credcheck");
 	EmitWarningsOnPlaceholders("credcheck_internal");
@@ -4905,6 +5223,16 @@ credcheck_max_auth_failure(Port *port, int status)
 	/* Inject a short delay if authentication failed. */
 	if (status != STATUS_OK)
 		pg_usleep(1000L * auth_delay_milliseconds);
+
+	/*
+	 * Refuse a successfully authenticated login outside the allowed days and
+	 * hours. This is done before the max_auth_failure processing so that a
+	 * refused login neither resets nor increments the failure counter, and
+	 * is not recorded in lastlog. Failed authentications are left alone: the
+	 * client must not learn anything about the policy before authenticating.
+	 */
+	if (status == STATUS_OK)
+		check_login_time(port);
 
 	/* get out if the user is whitelisted for auth failure */
 	if (is_in_whitelist(port->user_name, max_auth_whitelist))
