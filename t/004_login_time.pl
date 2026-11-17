@@ -28,6 +28,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use IPC::Run;
 
 # Fixed offset putting the server local time at about 12:00 now.
 my @utc = gmtime(time);
@@ -109,13 +110,32 @@ sub set_policy
 	}
 }
 
+# Run a query through psql with a full connection string and return
+# ($ret, $stdout, $stderr) like $node->psql(). The connstr parameter of
+# $node->psql() only exists since PostgreSQL 14: on older releases it is
+# silently ignored and psql connects as the bootstrap superuser, so do not
+# rely on it.
+sub psql_connstr
+{
+	my ($connstr, $sql) = @_;
+	my ($stdout, $stderr) = ('', '');
+	IPC::Run::run(
+	       [ 'psql', '-XAtq', '-v', 'ON_ERROR_STOP=1', '-d', $connstr, '-f', '-' ],
+	       '<', \$sql, '>', \$stdout, '2>', \$stderr,
+	       IPC::Run::timeout($ENV{PG_TEST_TIMEOUT_DEFAULT} // 180));
+	my $ret = $? >> 8;
+	chomp $stdout;
+	chomp $stderr;
+	return ($ret, $stdout, $stderr);
+}
+
 sub can_connect
 {
 	my ($user, $connstr_extra) = @_;
 	$connstr_extra //= '';
-	my ($ret, $stdout, $stderr) = $node->psql(
-		'postgres', 'SELECT 1',
-		connstr => $node->connstr('postgres') . " user=$user $connstr_extra");
+	my ($ret, $stdout, $stderr) = psql_connstr(
+	       $node->connstr('postgres') . " user=$user $connstr_extra", 'SELECT 1');
+
 	return ($ret == 0 && $stdout eq '1', $stderr);
 }
 
@@ -226,14 +246,14 @@ ok($node->log_contains(qr/Logins are denied on $today by credcheck\.login_denied
 # ---------------------------------------------------------------------------
 set_policy(login_denied_hours => '00:00-24:00', login_denied_days => $today);
 {
-	my ($ret, $out, $err) = $node->psql(
-		'postgres', 'IDENTIFY_SYSTEM',
-		connstr => $node->connstr('postgres') . ' user=alice replication=database');
+	my ($ret, $out, $err) = psql_connstr(
+	       $node->connstr('postgres') . ' user=alice replication=database',
+	       'IDENTIFY_SYSTEM');
 	is($ret, 0, 'logical replication connection is not refused') or diag($err);
 
-	($ret, $out, $err) = $node->psql(
-		'postgres', 'IDENTIFY_SYSTEM',
-		connstr => $node->connstr('postgres') . ' user=alice replication=true');
+	($ret, $out, $err) = psql_connstr(
+	       $node->connstr('postgres') . ' user=alice replication=true',
+	       'IDENTIFY_SYSTEM');
 	is($ret, 0, 'physical replication connection is not refused') or diag($err);
 }
 connect_refused_as('alice', 'but a normal connection of the same role is refused');
