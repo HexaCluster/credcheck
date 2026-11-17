@@ -103,6 +103,31 @@
 
 #define NOT_IN_PARALLEL_WORKER (ParallelWorkerNumber < 0)
 
+#if PG_VERSION_NUM < 160000
+/*
+ * guc_malloc() is only exported by utils/guc.h since PostgreSQL 16. On older
+ * releases the "extra" data returned by a GUC check hook must be allocated
+ * with malloc() because guc.c releases it with free(). Provide a local
+ * equivalent with the same semantic (report at elevel and return NULL on
+ * out of memory).
+ */
+static void *
+guc_malloc(int elevel, size_t size)
+{
+	void	   *data;
+
+	/* Avoid unportable behavior of malloc(0) */
+	if (size == 0)
+		size = 1;
+	data = malloc(size);
+	if (data == NULL)
+		ereport(elevel,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+	return data;
+}
+#endif
+
 /* Default passord encryption */
 #define Password_encryption = PASSWORD_TYPE_SCRAM_SHA_256;
 /* Name of external file to store password history in the PGDATA */
