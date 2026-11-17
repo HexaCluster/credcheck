@@ -248,7 +248,9 @@ connect_refused_as('alice', 'but a normal connection of the same role is refused
 		  . " user=alice application_name=standby'");
 	$standby->start;
 	$node->safe_psql('postgres', 'CREATE TABLE repl_check AS SELECT 42 AS v');
-	$node->wait_for_replay_catchup($standby);
+	# wait_for_replay_catchup() only exists since PostgreSQL 16, use the
+	# portable form (default mode is 'replay' up to the current primary LSN).
+	$node->wait_for_catchup($standby);
 	is($standby->safe_psql('postgres', 'SELECT v FROM repl_check'), '42',
 		'a standby streams as a non whitelisted role during a denied period');
 	$standby->stop;
