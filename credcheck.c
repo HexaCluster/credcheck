@@ -531,6 +531,12 @@ static bool username_contain_password = true;
 static bool username_ignore_case = false;
 static char *username_whitelist = NULL;
 static char *max_auth_whitelist = NULL;
+/*
+ * Roles listed in credcheck.whitelist_password_valid are exempted from the
+ * VALID UNTIL policy (password_valid_until, password_valid_min and
+ * password_valid_max) but are still subject to all other checks (issue #96).
+ */
+static char *password_valid_whitelist = NULL;
 
 /*
  * Login time restrictions: credcheck.login_denied_hours,
@@ -3270,6 +3276,13 @@ _PG_init(void)
 				&max_auth_whitelist, "", PGC_SUSET, 0, check_whitelist, NULL, NULL);
 
 	DefineCustomStringVariable(
+				"credcheck.whitelist_password_valid",
+				gettext_noop("comma separated list of username to exclude from the"
+				" VALID UNTIL policy (password_valid_until, password_valid_min and"
+				" password_valid_max), other password checks still apply"), NULL,
+				&password_valid_whitelist, "", PGC_SUSET, 0, check_whitelist, NULL, NULL);
+
+	DefineCustomStringVariable(
 				"credcheck.login_denied_hours",
 				gettext_noop("comma separated list of HH:MM-HH:MM time ranges"
 				" during which logins are refused"), NULL,
@@ -3584,6 +3597,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				char	  *password;
 				bool	   save_password = false;
 				bool	   has_other_option = false;
+				bool	   skip_valid_policy = false;
 				DefElem    *dvalidUntil = NULL;
 				DefElem    *dpassword = NULL;
 
@@ -3605,6 +3619,15 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				/* verify if the user in whitelisted or not */
 				if (is_in_whitelist(stmt->role->rolename, username_whitelist))
 					break;
+
+				/*
+				 * pg_upgrade restores rolvaliduntil as catalog data, so binary
+				 * upgrade behaves as if the VALID UNTIL policy GUCs were 0. Roles
+				 * listed in credcheck.whitelist_password_valid are exempted from
+				 * the VALID UNTIL policy too (issue #96).
+				 */
+				skip_valid_policy = IsBinaryUpgrade ||
+					is_in_whitelist(stmt->role->rolename, password_valid_whitelist);
 
 				/* Extract options from the statement node tree */
 				foreach(option, stmt->options)
@@ -3656,10 +3679,10 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				/*
 				 * when the user change his password, automatically set the valid until
 				 * date to now() + password_valid_until days if password_valid_until is set.
-				 * pg_upgrade restores rolvaliduntil as catalog data, so binary upgrade
-				 * behaves as if the VALID UNTIL policy GUCs were 0.
+				 * Skipped during binary upgrade and for roles in
+				 * credcheck.whitelist_password_valid.
 				 */
-				if (!dvalidUntil && password_valid_until > 0 && !IsBinaryUpgrade)
+				if (!dvalidUntil && password_valid_until > 0 && !skip_valid_policy)
 				{
 					Timestamp dt_now = GetCurrentTimestamp();
 					struct pg_tm tt, *tm = &tt;
@@ -3702,7 +3725,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				}
 
 				/* when a valid until date is set check that it is > to password_valid_until */
-				if (dvalidUntil && dvalidUntil->arg && password_valid_until > 0 && !IsBinaryUpgrade)
+				if (dvalidUntil && dvalidUntil->arg && password_valid_until > 0 && !skip_valid_policy)
 				{
 					int valid_until = check_valid_until(strVal(dvalidUntil->arg));
 					if (valid_until < password_valid_until)
@@ -3711,7 +3734,7 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 								errmsg(gettext_noop("the VALID UNTIL option must have a date older than %d days"), password_valid_until)));
 				}
 				/* check that the valid until date is not under the limit of days */
-				if (dvalidUntil && dvalidUntil->arg && !IsBinaryUpgrade)
+				if (dvalidUntil && dvalidUntil->arg && !skip_valid_policy)
 				{
 					int valid_max = check_valid_until(strVal(dvalidUntil->arg));
 					if (password_valid_until > 0 && valid_max < password_valid_until)
@@ -3754,12 +3777,16 @@ cc_ProcessUtility(PEL_PROCESSUTILITY_PROTO)
 				 * keeping a longer password_valid_until window for existing
 				 * roles that change their password (see issue #77).
 				 * pg_upgrade restores rolvaliduntil as catalog data, so binary
-				 * upgrade behaves as if the VALID UNTIL policy GUCs were 0.
+				 * upgrade behaves as if the VALID UNTIL policy GUCs were 0. Roles
+				 * listed in credcheck.whitelist_password_valid are exempted from
+				 * the VALID UNTIL policy too (issue #96).
 				 */
-				int	     create_valid = IsBinaryUpgrade ? 0 :
+				bool	    skip_valid_policy = IsBinaryUpgrade ||
+										is_in_whitelist(stmt->role, password_valid_whitelist);
+				int	     create_valid = skip_valid_policy ? 0 :
 										(password_valid_min > 0) ?
 										password_valid_min : password_valid_until;
-				int	     max_valid = IsBinaryUpgrade ? 0 : password_valid_max;
+				int	     max_valid = skip_valid_policy ? 0 : password_valid_max;
 				bool	    save_password = false;
 				char	   *password;
 				DefElem    *dpassword = NULL;

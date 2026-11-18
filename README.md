@@ -122,6 +122,10 @@ credcheck.whitelist = 'admin,supuser'
 ```
 will disable any credcheck policy for password change of users named `admin` or `supuser`.
 
+To only exempt some roles from the password expiration policy while still
+enforcing the other password checks (length, special characters, reuse, ...),
+use the `credcheck.whitelist_password_valid` GUC instead, see below.
+
 To disable password policy checks for changes done by a superuser, enable GUC `credcheck.superuser_nocheck`.
 
 ### [Last login information](#last-login-information)
@@ -453,6 +457,34 @@ postgres=# ALTER USER remi PASSWORD 'ChosenPass1';
 ```
 When `credcheck.password_valid_min` is left to 0 (the default), `CREATE ROLE`
 keeps using `credcheck.password_valid_until` exactly as before.
+
+Some roles, typically application or service accounts, must have a password
+that never expires while still being subject to the password complexity rules.
+The `credcheck.whitelist_password_valid` setting (comma separated list of role
+names, superuser only) exempts the listed roles from the whole VALID UNTIL
+policy (`credcheck.password_valid_until`, `credcheck.password_valid_min` and
+`credcheck.password_valid_max`): no VALID UNTIL clause is added automatically
+and any VALID UNTIL value, `'infinity'` included, is accepted in `CREATE ROLE`
+and `ALTER ROLE`. All other credcheck checks still apply to these roles.
+```
+postgres=# SET credcheck.password_valid_until = 30;
+postgres=# SET credcheck.password_valid_max = 180;
+postgres=# SET credcheck.password_min_length = 12;
+postgres=# SET credcheck.whitelist_password_valid = 'appuser';
+
+-- no expiration date is set for appuser
+postgres=# CREATE USER appuser PASSWORD 'AppPassword123';
+CREATE ROLE
+
+postgres=# ALTER USER appuser VALID UNTIL 'infinity';
+ALTER ROLE
+
+-- but the password policy is still enforced
+postgres=# ALTER USER appuser PASSWORD 'short';
+ERROR:  password length should match the configured credcheck.password_min_length (12)
+```
+Adding a role to this list does not modify an expiration date already stored
+for that role; use `ALTER ROLE ... VALID UNTIL 'infinity'` to clear it.
 
 If you have enabled the use of cracklib to check the easiness of a password
 you could have this kind of messages:

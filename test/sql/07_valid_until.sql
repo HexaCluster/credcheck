@@ -141,3 +141,52 @@ CREATE USER remi PASSWORD 'DummY1' VALID UNTIL '2020-01-01';
 SET credcheck.password_valid_min TO DEFAULT;
 SET credcheck.password_valid_until TO DEFAULT;
 SET credcheck.password_valid_max TO DEFAULT;
+
+--
+-- issue #96: roles listed in credcheck.whitelist_password_valid are exempted
+-- from the VALID UNTIL policy (password_valid_until, password_valid_min and
+-- password_valid_max) but all other password checks still apply.
+--
+SET credcheck.password_valid_until TO 30;
+SET credcheck.password_valid_min TO 5;
+SET credcheck.password_valid_max TO 90;
+SET credcheck.password_min_length TO 8;
+SET credcheck.whitelist_password_valid TO 'appuser, "Batch_User"';
+-- success: no VALID UNTIL is injected for a whitelisted role
+CREATE USER appuser PASSWORD 'AppPass123';
+SELECT rolname, rolvaliduntil IS NULL AS no_expiry FROM pg_roles WHERE rolname='appuser';
+-- success: password change keeps the role without expiration
+ALTER USER appuser PASSWORD 'AppPass456';
+SELECT rolname, rolvaliduntil IS NULL AS no_expiry FROM pg_roles WHERE rolname='appuser';
+-- success: VALID UNTIL 'infinity' and dates beyond password_valid_max are accepted
+ALTER USER appuser VALID UNTIL 'infinity';
+SELECT rolname, rolvaliduntil = 'infinity' AS infinite FROM pg_roles WHERE rolname='appuser';
+ALTER USER appuser PASSWORD 'AppPass789' VALID UNTIL '2999-01-01';
+-- fail: the password complexity rules are still enforced
+ALTER USER appuser PASSWORD 'short';
+DROP USER appuser;
+CREATE USER appuser PASSWORD 'short';
+CREATE USER appuser PASSWORD 'AppPass123' VALID UNTIL 'infinity';
+SELECT rolname, rolvaliduntil = 'infinity' AS infinite FROM pg_roles WHERE rolname='appuser';
+DROP USER appuser;
+-- quoted identifiers in the list are case sensitive
+CREATE USER "Batch_User" PASSWORD 'BatchPass1';
+SELECT rolname, rolvaliduntil IS NULL AS no_expiry FROM pg_roles WHERE rolname='Batch_User';
+DROP USER "Batch_User";
+-- a role not in the list still gets the VALID UNTIL policy
+CREATE USER otheruser PASSWORD 'OtherPass1';
+SELECT rolname, rolvaliduntil between now() + '4 days'::interval and now() + '6 days'::interval AS min_window FROM pg_roles WHERE rolname='otheruser';
+ALTER USER otheruser VALID UNTIL 'infinity';
+ALTER USER otheruser PASSWORD 'OtherPass2' VALID UNTIL '2999-01-01';
+DROP USER otheruser;
+-- the setting can only be changed by a superuser
+CREATE USER low_priv;
+SET ROLE low_priv;
+SET credcheck.whitelist_password_valid TO 'low_priv';
+RESET ROLE;
+DROP ROLE low_priv;
+RESET credcheck.whitelist_password_valid;
+SET credcheck.password_min_length TO DEFAULT;
+SET credcheck.password_valid_min TO DEFAULT;
+SET credcheck.password_valid_until TO DEFAULT;
+SET credcheck.password_valid_max TO DEFAULT;

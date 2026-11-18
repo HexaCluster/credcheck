@@ -180,3 +180,86 @@ ERROR:  require a VALID UNTIL option with a date older than 30 days
 SET credcheck.password_valid_min TO DEFAULT;
 SET credcheck.password_valid_until TO DEFAULT;
 SET credcheck.password_valid_max TO DEFAULT;
+--
+-- issue #96: roles listed in credcheck.whitelist_password_valid are exempted
+-- from the VALID UNTIL policy (password_valid_until, password_valid_min and
+-- password_valid_max) but all other password checks still apply.
+--
+SET credcheck.password_valid_until TO 30;
+SET credcheck.password_valid_min TO 5;
+SET credcheck.password_valid_max TO 90;
+SET credcheck.password_min_length TO 8;
+SET credcheck.whitelist_password_valid TO 'appuser, "Batch_User"';
+-- success: no VALID UNTIL is injected for a whitelisted role
+CREATE USER appuser PASSWORD 'AppPass123';
+SELECT rolname, rolvaliduntil IS NULL AS no_expiry FROM pg_roles WHERE rolname='appuser';
+ rolname | no_expiry 
+---------+-----------
+ appuser | t
+(1 row)
+
+-- success: password change keeps the role without expiration
+ALTER USER appuser PASSWORD 'AppPass456';
+SELECT rolname, rolvaliduntil IS NULL AS no_expiry FROM pg_roles WHERE rolname='appuser';
+ rolname | no_expiry 
+---------+-----------
+ appuser | t
+(1 row)
+
+-- success: VALID UNTIL 'infinity' and dates beyond password_valid_max are accepted
+ALTER USER appuser VALID UNTIL 'infinity';
+SELECT rolname, rolvaliduntil = 'infinity' AS infinite FROM pg_roles WHERE rolname='appuser';
+ rolname | infinite 
+---------+----------
+ appuser | t
+(1 row)
+
+ALTER USER appuser PASSWORD 'AppPass789' VALID UNTIL '2999-01-01';
+-- fail: the password complexity rules are still enforced
+ALTER USER appuser PASSWORD 'short';
+ERROR:  password length should match the configured credcheck.password_min_length (8)
+DROP USER appuser;
+CREATE USER appuser PASSWORD 'short';
+ERROR:  password length should match the configured credcheck.password_min_length (8)
+CREATE USER appuser PASSWORD 'AppPass123' VALID UNTIL 'infinity';
+SELECT rolname, rolvaliduntil = 'infinity' AS infinite FROM pg_roles WHERE rolname='appuser';
+ rolname | infinite 
+---------+----------
+ appuser | t
+(1 row)
+
+DROP USER appuser;
+-- quoted identifiers in the list are case sensitive
+CREATE USER "Batch_User" PASSWORD 'BatchPass1';
+SELECT rolname, rolvaliduntil IS NULL AS no_expiry FROM pg_roles WHERE rolname='Batch_User';
+  rolname   | no_expiry 
+------------+-----------
+ Batch_User | t
+(1 row)
+
+DROP USER "Batch_User";
+-- a role not in the list still gets the VALID UNTIL policy
+CREATE USER otheruser PASSWORD 'OtherPass1';
+SELECT rolname, rolvaliduntil between now() + '4 days'::interval and now() + '6 days'::interval AS min_window FROM pg_roles WHERE rolname='otheruser';
+  rolname  | min_window 
+-----------+------------
+ otheruser | t
+(1 row)
+
+ALTER USER otheruser VALID UNTIL 'infinity';
+ERROR:  the VALID UNTIL option must NOT have a date beyond 90 days
+ALTER USER otheruser PASSWORD 'OtherPass2' VALID UNTIL '2999-01-01';
+ERROR:  the VALID UNTIL option must NOT have a date beyond 90 days
+DROP USER otheruser;
+-- the setting can only be changed by a superuser
+CREATE USER low_priv;
+SET ROLE low_priv;
+SET credcheck.whitelist_password_valid TO 'low_priv';
+ERROR:  permission denied to set parameter "credcheck.whitelist_password_valid"
+RESET ROLE;
+DROP ROLE low_priv;
+RESET credcheck.whitelist_password_valid;
+SET credcheck.password_min_length TO DEFAULT;
+SET credcheck.password_valid_min TO DEFAULT;
+SET credcheck.password_valid_until TO DEFAULT;
+SET credcheck.password_valid_max TO DEFAULT;
